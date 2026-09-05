@@ -1,0 +1,113 @@
+# Kanban Agents
+
+A Trello-style board that schedules Claude Code sessions. Drag a card into
+**In Progress** and it runs. Cards run **strictly one at a time, in one working
+directory**, so each task builds on the previous one's changes instead of
+fighting it on a separate branch.
+
+## Run it
+
+```bash
+npm run setup
+```
+
+```bash
+npm start
+```
+
+Then open <http://localhost:4317>.
+
+`npm start` builds the web app and serves it from the API server on one port.
+For UI work, run the two halves separately instead — `npm run server` in one
+terminal and `npm run web` in another (Vite on :5317, proxying to :4317).
+
+### Authentication
+
+Sessions are spawned through the Claude Agent SDK, which uses the same
+credentials as the `claude` CLI. If a card fails with
+`401 OAuth access token has expired`, run `claude` in a terminal and log in
+(or set `ANTHROPIC_API_KEY` before starting the server), then reply on the card
+to retry it.
+
+## The columns
+
+| Column | What it means |
+| --- | --- |
+| **Not Started** | Drafted, not queued. Nothing runs here. |
+| **In Progress** | The run queue. The top card runs; the rest wait their turn. |
+| **Needs Input** | The session is blocked on you — a permission prompt, a question, an error, or a stop. |
+| **Review** | Finished successfully; you haven't checked it yet. |
+| **Done** | Checked and accepted. |
+| **Cancelled** | Not doing it. Dragging a running card here stops its session. |
+
+## How the queue works
+
+Exactly one session may run at a time. When it ends, the next card in
+**In Progress** starts — so the order you drag cards into that column is the
+order they execute in, and each one sees the working tree the previous one left.
+
+The queue holds while any card sits in **Needs Input** (a setting you can turn
+off). That is deliberate: starting the next task on a tree that a blocked task
+left half-finished is how you get conflicts.
+
+- **Pause queue** stops new cards from starting; the running one finishes.
+- **Stop current** interrupts the running session and parks it in Needs Input.
+
+## Cards
+
+Click a card to open it.
+
+- **Session** — the live transcript. Assistant text streams token by token; tool
+  calls are collapsible with their inputs and outputs; thinking blocks are
+  foldable. The reply box sends into a *running* session immediately. Reply to a
+  *finished* card and it resumes that same session from the front of the queue.
+- **Task** — the prompt, plus per-card overrides for model, permission mode,
+  effort, working directory, and labels. Blank means "use the board default".
+- **Changes** — the final summary, git branch and commit before/after, and a
+  diffstat of what the session actually touched.
+
+### Needs Input
+
+When Claude asks for a permission it doesn't have, the card moves itself to
+Needs Input and the session **stays open**, waiting. Approve or deny it from the
+card and the session picks up where it left off and the card slides back to
+In Progress. `AskUserQuestion` works the same way, with the options rendered as
+buttons.
+
+The default permission mode is `acceptEdits` — file edits go through, commands
+ask. Set a card (or the board) to `bypassPermissions` for fully unattended runs,
+or `plan` to have Claude write a plan without touching anything.
+
+## Settings
+
+Board defaults for working directory, model, permission mode, and effort; where
+a finished card lands (Review or Done); a max-turns cap; whether the queue holds
+on Needs Input; and an extra system prompt appended to every session — useful
+for standing rules like "always run the test suite before you finish".
+
+## Data
+
+Everything lives in `~/.kanban-agents`:
+
+- `board.json` — cards and settings
+- `logs/<card-id>.jsonl` — one transcript per card
+
+Set `KANBAN_DATA_DIR` to move it, `PORT` to change the port. Session transcripts
+are also written to `~/.claude/projects` by the CLI itself, so a card's session
+can be resumed from the `claude` CLI too.
+
+If the server dies mid-session, the card is requeued on the next start.
+
+## Layout
+
+```
+server/src/
+  index.js    HTTP + SSE API
+  runner.js   the single-slot queue and Agent SDK session driver
+  store.js    JSON board + JSONL transcripts
+  git.js      before/after snapshots and diffstat
+web/src/
+  App.jsx           board, columns, drag and drop
+  CardDetail.jsx    transcript, permissions, reply, per-card settings
+  SettingsDialog.jsx
+```
