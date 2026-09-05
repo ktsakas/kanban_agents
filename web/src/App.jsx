@@ -313,6 +313,13 @@ export default function App() {
         </div>
       </header>
 
+      {board.auth && !board.auth.ok && (
+        <div className="auth-bar">
+          <strong>Claude isn&rsquo;t logged in.</strong> {board.auth.reason} {board.auth.hint}
+          <span className="auth-cmd">claude</span>
+        </div>
+      )}
+
       <div className="workdir-bar">
         <code>{board.settings.workingDir}</code>
         <span className="sep">&mdash;</span>

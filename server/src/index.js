@@ -9,6 +9,7 @@ import * as store from './store.js';
 import { bus } from './bus.js';
 import { runner } from './runner.js';
 import * as git from './git.js';
+import { checkAuth } from './auth.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT ?? 4317);
@@ -27,6 +28,7 @@ function boardPayload() {
     cards: store.listCards(),
     settings: store.getSettings(),
     runningCardId: runner.current?.cardId ?? null,
+    auth: checkAuth(),
   };
 }
 

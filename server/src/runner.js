@@ -3,6 +3,7 @@ import { query } from '@anthropic-ai/claude-agent-sdk';
 import * as store from './store.js';
 import { emitBoard, emitCardEvent } from './bus.js';
 import * as git from './git.js';
+import { checkAuth } from './auth.js';
 
 /* --------------------------- streaming input ----------------------------- */
 
@@ -111,6 +112,7 @@ class Runner {
       cards: store.listCards(),
       settings: store.getSettings(),
       runningCardId: this.current?.cardId ?? null,
+      auth: checkAuth(),
     });
   }
 
