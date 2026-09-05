@@ -553,7 +553,9 @@ h1, h2, h3, h4 { margin: 0; font-weight: 600; }
 
 .textarea-wrap { position: relative; }
 .textarea-wrap textarea { padding-right: 38px; }
-.textarea-wrap .mic-btn { position: absolute; right: 7px; bottom: 7px; }
+/* Anchored to the top, not the bottom: the wrap also holds the status line,
+   and bottom-anchoring pushed the button down over that text. */
+.textarea-wrap .mic-btn { position: absolute; right: 7px; top: 7px; }
 
 .mic-btn {
   width: 26px; height: 26px; flex-shrink: 0;
@@ -570,6 +572,13 @@ h1, h2, h3, h4 { margin: 0; font-weight: 600; }
   animation: breathe 1.2s ease-in-out infinite;
 }
 .mic-btn.has-error { background: var(--run-soft); border-color: var(--run); color: var(--run); }
+
+/* The failure needs to be readable, not hidden behind a hover on a 26px dot. */
+.mic-status {
+  margin: 6px 0 0; font-size: 11.5px; line-height: 1.45;
+  color: var(--ink-3);
+}
+.mic-status.is-error { color: var(--bad); }
 
 /* -------------------------------- composer ------------------------------- */
 

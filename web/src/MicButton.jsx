@@ -4,17 +4,19 @@ const SpeechRecognitionImpl =
   typeof window !== 'undefined' ? window.SpeechRecognition || window.webkitSpeechRecognition : null;
 
 const ERROR_MESSAGES = {
-  'not-allowed': 'Microphone permission was denied',
+  'not-allowed':
+    'Microphone blocked. Click the padlock in the address bar and allow the microphone — or open this page in Chrome or Edge directly, since embedded browsers block capture entirely.',
   'service-not-allowed':
-    'Speech service blocked — on Windows, check Settings > Privacy & security > Speech > Online speech recognition',
-  'audio-capture': 'No microphone found',
-  network: 'Speech service unreachable — check your internet connection',
-  'no-speech': "Didn't hear anything",
-  'start-failed': 'Could not start the microphone',
+    'Windows is blocking the speech service. Turn on Settings > Privacy & security > Speech > Online speech recognition.',
+  'audio-capture': 'No microphone was found.',
+  network: 'Could not reach the speech service. Dictation needs an internet connection.',
+  'no-speech': 'Nothing was heard.',
+  'start-failed': 'The microphone could not be started.',
+  unsupported: 'Dictation needs Chrome or Edge — this browser has no Web Speech API.',
 };
 
 function errorMessage(code) {
-  return ERROR_MESSAGES[code] || `Dictation error (${code})`;
+  return ERROR_MESSAGES[code] || `Dictation failed (${code}).`;
 }
 
 /**
@@ -34,6 +36,7 @@ function useDictation(onFinalText) {
   const recognitionRef = useRef(null);
   const wantRef = useRef(false);
   const restartTimerRef = useRef(null);
+  const silentCyclesRef = useRef(0);
   const onFinalRef = useRef(onFinalText);
   onFinalRef.current = onFinalText;
 
@@ -59,6 +62,7 @@ function useDictation(onFinalText) {
         if (res.isFinal) chunk += res[0].transcript;
       }
       if (chunk.trim()) {
+        silentCyclesRef.current = 0;
         setError(null);
         onFinalRef.current(chunk.trim());
       }
@@ -76,11 +80,19 @@ function useDictation(onFinalText) {
 
     rec.onend = () => {
       recognitionRef.current = null;
-      if (wantRef.current) {
+      // Chrome ends on silence even in continuous mode, so we respawn. Cap the
+      // respawns that heard nothing at all, or a mic left on by accident loops
+      // forever with no visible sign of it.
+      if (wantRef.current && silentCyclesRef.current < 4) {
+        silentCyclesRef.current += 1;
         restartTimerRef.current = setTimeout(() => {
           if (wantRef.current) attempt();
         }, 250);
         return;
+      }
+      if (wantRef.current) {
+        wantRef.current = false;
+        setError('no-speech');
       }
       setListening(false);
     };
@@ -104,6 +116,7 @@ function useDictation(onFinalText) {
   const start = () => {
     if (!SpeechRecognitionImpl) return;
     setError(null);
+    silentCyclesRef.current = 0;
     wantRef.current = true;
     attempt();
   };
@@ -131,31 +144,36 @@ function useDictation(onFinalText) {
 export default function MicButton({ onText, title = 'Dictate', className = '' }) {
   const { supported, listening, error, toggle } = useDictation(onText);
 
+  const failure = !supported ? 'unsupported' : error;
+
   let label = '🎤';
   let tip = title;
   let stateClass = '';
-  if (!supported) {
-    tip = 'Voice dictation needs Chrome or Edge';
+  if (failure) {
+    label = '⚠';
+    tip = errorMessage(failure);
+    stateClass = 'has-error';
   } else if (listening) {
     label = '●';
-    tip = 'Listening… click to stop';
+    tip = 'Listening — click to stop';
     stateClass = 'is-listening';
-  } else if (error) {
-    label = '⚠';
-    tip = errorMessage(error);
-    stateClass = 'has-error';
   }
 
   return (
-    <button
-      type="button"
-      className={`mic-btn ${stateClass} ${className}`}
-      onClick={toggle}
-      disabled={!supported}
-      title={tip}
-    >
-      {label}
-    </button>
+    <>
+      <button
+        type="button"
+        className={`mic-btn ${stateClass} ${className}`}
+        onClick={toggle}
+        disabled={!supported}
+        title={tip}
+      >
+        {label}
+      </button>
+      {/* A 26px button's tooltip is not a place to explain a failure. */}
+      {failure && <p className="mic-status is-error">{errorMessage(failure)}</p>}
+      {listening && <p className="mic-status">Listening — click the dot to stop.</p>}
+    </>
   );
 }
 
