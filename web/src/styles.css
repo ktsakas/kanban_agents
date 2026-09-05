@@ -579,6 +579,12 @@ h1, h2, h3, h4 { margin: 0; font-weight: 600; }
   color: var(--ink-3);
 }
 .mic-status.is-error { color: var(--bad); }
+.mic-link {
+  background: none; border: none; padding: 0; cursor: pointer;
+  color: inherit; font: inherit; text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.mic-link:hover { color: var(--ink); }
 
 /* -------------------------------- composer ------------------------------- */
 
