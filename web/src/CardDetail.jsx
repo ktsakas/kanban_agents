@@ -12,6 +12,16 @@ function duration(ms) {
   return `${Math.floor(s / 60)}m ${s % 60}s`;
 }
 
+function turns(n) {
+  return `${n} turn${n === 1 ? '' : 's'}`;
+}
+
+/** Sub-cent runs read as noise at three decimals; show them as a floor. */
+function cost(usd) {
+  if (usd == null) return null;
+  return usd < 0.001 ? '<$0.001' : `$${usd.toFixed(3)}`;
+}
+
 function previewToolInput(name, input) {
   if (!input) return '';
   if (name === 'Bash') return input.command ?? '';
@@ -33,7 +43,7 @@ function ToolEvent({ event, result }) {
         <span className="tool-caret">{open ? '▾' : '▸'}</span>
         <span className="tool-name">{event.name}</span>
         <span className="tool-preview">{previewToolInput(event.name, event.input)}</span>
-        {!result && <span className="spinner spinner-sm" />}
+        {!result && <span className="live-dot" />}
         {failed && <span className="tool-flag">error</span>}
       </button>
       {open && (
@@ -160,8 +170,8 @@ function Transcript({ cardId, isRunning }) {
               <div key={i} className={`ev ev-result ${event.isError ? 'is-error' : ''}`}>
                 <b>{event.isError ? 'Ended with error' : 'Turn complete'}</b>
                 <span>
-                  {duration(event.durationMs)} &middot; {event.numTurns} turns
-                  {event.costUsd != null && ` · $${event.costUsd.toFixed(3)}`}
+                  {duration(event.durationMs)} &middot; {turns(event.numTurns)}
+                  {event.costUsd ? ` · ${cost(event.costUsd)}` : ''}
                 </span>
               </div>
             );
@@ -191,7 +201,7 @@ function Transcript({ cardId, isRunning }) {
       )}
       {isRunning && !live.text && !live.thinking && (
         <div className="ev ev-note working">
-          <span className="spinner spinner-sm" /> working...
+          <span className="live-dot" /> working&hellip;
         </div>
       )}
     </div>
@@ -334,13 +344,15 @@ export default function CardDetail({ card, settings, isRunning, columns, onClose
           <span className="tabs-spacer" />
           {card.stats && (
             <span className="tabs-stats">
-              {duration(card.stats.durationMs)} &middot; {card.stats.numTurns} turns
-              {card.stats.costUsd != null && ` · $${card.stats.costUsd.toFixed(3)}`}
+              {duration(card.stats.durationMs)} &middot; {turns(card.stats.numTurns)}
+              {card.stats.costUsd ? ` · ${cost(card.stats.costUsd)}` : ''}
             </span>
           )}
         </nav>
 
-        {card.error && <div className="banner banner-error">{card.error}</div>}
+        {card.error && tab !== 'session' && (
+          <div className="banner banner-error">{card.error}</div>
+        )}
 
         {tab === 'session' && (
           <>

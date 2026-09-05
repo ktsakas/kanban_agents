@@ -53,21 +53,18 @@ function Card({ card, isRunning, queuePosition, onOpen, onDragStart, onDragEnd, 
       {card.prompt && <p className="card-prompt">{card.prompt}</p>}
 
       <div className="card-meta">
-        {isRunning && (
-          <span className="pill pill-running">
-            <span className="spinner" /> Running
-          </span>
-        )}
-        {!isRunning && queuePosition != null && (
-          <span className="pill pill-queued">#{queuePosition + 1} in queue</span>
-        )}
-        {!isRunning && queuePosition == null && card.runState !== 'idle' && (
-          <span className={`pill pill-${card.runState}`}>{RUN_STATE_LABEL[card.runState]}</span>
-        )}
-        {card.pendingPermission && <span className="pill pill-waiting">Needs answer</span>}
-        {card.model && <span className="pill pill-ghost">{card.model.replace('claude-', '')}</span>}
+        {isRunning ? (
+          <span className="state state-running">Running</span>
+        ) : card.pendingPermission ? (
+          <span className="state state-waiting">Needs answer</span>
+        ) : queuePosition != null ? (
+          <span className="state state-queued">Next {queuePosition + 1}</span>
+        ) : card.runState !== 'idle' ? (
+          <span className={`state state-${card.runState}`}>{RUN_STATE_LABEL[card.runState]}</span>
+        ) : null}
+        {card.model && <span className="tag tag-model">{card.model.replace('claude-', '')}</span>}
         {card.labels?.map((label) => (
-          <span key={label} className="pill pill-label">
+          <span key={label} className="tag">
             {label}
           </span>
         ))}
@@ -75,7 +72,11 @@ function Card({ card, isRunning, queuePosition, onOpen, onDragStart, onDragEnd, 
 
       {(stats || card.finishedAt) && (
         <footer className="card-foot">
-          {stats?.numTurns != null && <span>{stats.numTurns} turns</span>}
+          {stats?.numTurns != null && (
+            <span>
+              {stats.numTurns} turn{stats.numTurns === 1 ? '' : 's'}
+            </span>
+          )}
           {stats?.costUsd != null && <span>{formatCost(stats.costUsd)}</span>}
           {card.finishedAt && <span>{relativeTime(card.finishedAt)}</span>}
         </footer>
@@ -105,6 +106,7 @@ function Column({ column, cards, runningCardId, onOpen, onDrop, drag, setDrag, o
   return (
     <section
       className="column"
+      data-col={column.id}
       onDragOver={(e) => {
         e.preventDefault();
         e.dataTransfer.dropEffect = 'move';
@@ -119,8 +121,7 @@ function Column({ column, cards, runningCardId, onOpen, onDrop, drag, setDrag, o
         if (id) onDrop(id, column.id, computeIndex(e));
       }}
     >
-      <header className="column-head" style={{ '--accent': column.accent }}>
-        <span className="column-dot" />
+      <header className="column-head">
         <h2>{column.title}</h2>
         <span className="column-count">{cards.length}</span>
         <button className="icon-btn" title="Add a task" onClick={() => setAdding((v) => !v)}>
@@ -193,8 +194,14 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [search, setSearch] = useState('');
   const [drag, setDrag] = useState({ cardId: null, overColumn: null, overIndex: null });
+  const [theme, setTheme] = useState(() => localStorage.getItem('theme') ?? 'light');
 
   useEffect(() => subscribe('/stream/board', setBoard), []);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    localStorage.setItem('theme', theme);
+  }, [theme]);
 
   const refresh = useCallback(async () => setBoard(await api.board()), []);
 
@@ -236,7 +243,7 @@ export default function App() {
   if (!board) {
     return (
       <div className="boot">
-        <span className="spinner" /> Connecting to the agent server...
+        Connecting to the agent server&hellip;
       </div>
     );
   }
@@ -252,8 +259,7 @@ export default function App() {
     <div className="app">
       <header className="topbar">
         <div className="brand">
-          <span className="brand-mark" />
-          <strong>Kanban Agents</strong>
+          Kanban <em>Agents</em>
         </div>
 
         <div className={`queue-status ${paused ? 'is-paused' : ''}`}>
@@ -261,7 +267,7 @@ export default function App() {
             <>Queue paused &middot; {queueDepth} waiting</>
           ) : running ? (
             <>
-              <span className="spinner" /> Running <b>{running.title}</b>
+              <span className="live-dot" /> Running <b>{running.title}</b>
               {queueDepth > 1 && <> &middot; {queueDepth - 1} queued</>}
             </>
           ) : blocked ? (
@@ -269,7 +275,7 @@ export default function App() {
           ) : queueDepth ? (
             <>Starting next...</>
           ) : (
-            <>Idle &middot; drop a card in In Progress to run it</>
+            <>Idle</>
           )}
         </div>
 
@@ -297,14 +303,22 @@ export default function App() {
           <button className="btn" onClick={() => setShowSettings(true)}>
             Settings
           </button>
+          <button
+            className="icon-btn"
+            title={theme === 'dark' ? 'Switch to light' : 'Switch to dark'}
+            onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
+          >
+            {theme === 'dark' ? '☾' : '☀'}
+          </button>
         </div>
       </header>
 
       <div className="workdir-bar">
-        <span>Working directory</span>
         <code>{board.settings.workingDir}</code>
-        <span className="sep">|</span>
-        <span>All sessions run here, one at a time, building on each other.</span>
+        <span className="sep">&mdash;</span>
+        <span className="note">
+          every session runs here, one at a time, building on the last one&rsquo;s changes
+        </span>
       </div>
 
       <main className="board">
