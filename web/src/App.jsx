@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, subscribe } from './api.js';
 import CardDetail from './CardDetail.jsx';
 import SettingsDialog from './SettingsDialog.jsx';
+import MicButton, { appendDictation } from './MicButton.jsx';
 
 const RUN_STATE_LABEL = {
   idle: 'Idle',
@@ -139,16 +140,19 @@ function Column({ column, cards, runningCardId, onOpen, onDrop, drag, setDrag, o
             setAdding(false);
           }}
         >
-          <textarea
-            autoFocus
-            placeholder="What should Claude do?"
-            value={draft}
-            onChange={(e) => setDraft(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) e.currentTarget.form.requestSubmit();
-              if (e.key === 'Escape') setAdding(false);
-            }}
-          />
+          <div className="textarea-wrap">
+            <textarea
+              autoFocus
+              placeholder="What should Claude do?"
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) e.currentTarget.form.requestSubmit();
+                if (e.key === 'Escape') setAdding(false);
+              }}
+            />
+            <MicButton title="Dictate task" onText={(chunk) => setDraft((d) => appendDictation(d, chunk))} />
+          </div>
           <div className="quick-add-actions">
             <button type="submit" className="btn btn-primary">
               Add
@@ -236,8 +240,9 @@ export default function App() {
   );
 
   const quickAdd = useCallback(async (column, prompt) => {
-    const title = prompt.length > 70 ? `${prompt.slice(0, 70)}...` : prompt;
-    await api.createCard({ title, prompt, column });
+    // No title: the server generates one from the task description and
+    // pushes the update over SSE once it's ready.
+    await api.createCard({ prompt, column });
   }, []);
 
   if (!board) {

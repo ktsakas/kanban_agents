@@ -106,12 +106,19 @@ function nextOrder(column) {
   return inColumn.length ? Math.max(...inColumn.map((c) => c.order)) + 1 : 0;
 }
 
+/** Instant placeholder shown until the AI-generated title lands (or forever, as a fallback if that fails). */
+function fallbackTitle(prompt) {
+  const text = (prompt ?? '').trim().split('\n')[0].trim();
+  if (!text) return 'Untitled task';
+  return text.length > 70 ? `${text.slice(0, 70)}...` : text;
+}
+
 export function createCard(input = {}) {
   const now = new Date().toISOString();
   const column = COLUMN_IDS.includes(input.column) ? input.column : 'backlog';
   const card = {
     id: randomUUID(),
-    title: (input.title ?? '').trim() || 'Untitled task',
+    title: (input.title ?? '').trim() || fallbackTitle(input.prompt),
     prompt: input.prompt ?? '',
     column,
     order: nextOrder(column),

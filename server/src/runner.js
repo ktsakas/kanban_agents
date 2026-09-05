@@ -85,7 +85,14 @@ class Runner {
 
   /* ------------------------------ lifecycle ------------------------------ */
 
-  /** Cards that died with a previous process get put back at the front of the queue. */
+  /**
+   * Cards that died with a previous process go back on the queue.
+   *
+   * They must also move back to In Progress. A card killed while `waiting`
+   * sits in Needs Input, but its prompt died with the process and is cleared
+   * here — so leaving it there would hold the whole queue (pauseOnNeedsInput)
+   * on a card that can never unblock itself.
+   */
   recover() {
     let changed = false;
     for (const card of store.listCards()) {
@@ -95,6 +102,7 @@ class Runner {
           pendingPermission: null,
           error: null,
         });
+        if (card.column === 'needs_input') store.moveCard(card.id, 'in_progress', 0);
         store.appendEvent(card.id, {
           type: 'status',
           level: 'warn',
@@ -148,9 +156,15 @@ class Runner {
     if (settings.queuePaused) return;
 
     const cards = store.listCards();
-    if (settings.pauseOnNeedsInput && cards.some((c) => c.column === 'needs_input')) {
-      return;
-    }
+    // Only a card that is genuinely waiting on the user holds the queue. A
+    // card sitting in Needs Input with nothing pending (e.g. requeued after a
+    // restart) is not blocked, and must not stall everything behind it.
+    const blocked = cards.some(
+      (c) =>
+        c.column === 'needs_input' &&
+        (c.pendingPermission || ['error', 'stopped', 'waiting'].includes(c.runState)),
+    );
+    if (settings.pauseOnNeedsInput && blocked) return;
 
     const next = cards
       .filter((c) => c.column === 'in_progress' && c.runState !== 'running')

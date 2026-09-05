@@ -78,6 +78,22 @@ The default permission mode is `acceptEdits` — file edits go through, commands
 ask. Set a card (or the board) to `bypassPermissions` for fully unattended runs,
 or `plan` to have Claude write a plan without touching anything.
 
+### Dictation
+
+Every text field that feeds the queue — the quick-add box on each column, the
+reply composer, and the answer/deny-reason fields in Needs Input — has a 🎤
+button next to it. Click it, talk, click again (or it keeps listening until
+you do). Finished phrases are appended to the field as text; nothing is sent
+until you press the field's own button, so you can review or edit before
+submitting.
+
+This uses the browser's built-in Web Speech API (no server support or extra
+dependency involved), so it needs Chrome or Edge, and the browser will ask for
+microphone permission the first time. Note that those browsers typically send
+the audio to their vendor's speech service to transcribe it — this isn't a
+fully offline/local transcription. The 🎤 button disables itself with an
+explanatory tooltip in browsers that don't support it.
+
 ## Settings
 
 Board defaults for working directory, model, permission mode, and effort; where
@@ -110,4 +126,5 @@ web/src/
   App.jsx           board, columns, drag and drop
   CardDetail.jsx    transcript, permissions, reply, per-card settings
   SettingsDialog.jsx
+  MicButton.jsx     mic-to-text dictation, shared by every text field
 ```

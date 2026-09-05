@@ -10,6 +10,7 @@ import { bus } from './bus.js';
 import { runner } from './runner.js';
 import * as git from './git.js';
 import { checkAuth } from './auth.js';
+import { generateTitle } from './titler.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT ?? 4317);
@@ -44,10 +45,24 @@ api.patch('/settings', (req, res) => {
 /* -------------------------------- cards ---------------------------------- */
 
 api.post('/cards', (req, res) => {
-  const card = store.createCard(req.body ?? {});
+  const body = req.body ?? {};
+  const card = store.createCard(body);
   runner.broadcast();
   runner.tick();
   res.status(201).json(card);
+
+  // No explicit title from the client: derive one from the task description
+  // in the background and push the update once it lands.
+  const hadExplicitTitle = Boolean((body.title ?? '').trim());
+  if (!hadExplicitTitle && card.prompt?.trim()) {
+    generateTitle(card.prompt)
+      .then((title) => {
+        if (!title || !store.getCard(card.id)) return;
+        store.updateCard(card.id, { title });
+        runner.broadcast();
+      })
+      .catch((err) => console.error('[titler] failed to update card title:', err));
+  }
 });
 
 api.patch('/cards/:id', (req, res) => {

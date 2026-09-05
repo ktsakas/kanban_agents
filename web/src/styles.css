@@ -549,6 +549,28 @@ h1, h2, h3, h4 { margin: 0; font-weight: 600; }
 .question-text { margin: 0 0 8px; font-size: 13.5px; }
 .question-options { display: flex; flex-wrap: wrap; gap: 6px; }
 
+/* ------------------------------ dictation --------------------------------- */
+
+.textarea-wrap { position: relative; }
+.textarea-wrap textarea { padding-right: 38px; }
+.textarea-wrap .mic-btn { position: absolute; right: 7px; bottom: 7px; }
+
+.mic-btn {
+  width: 26px; height: 26px; flex-shrink: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--surface); border: 1px solid var(--rule-2);
+  border-radius: 50%; cursor: pointer;
+  color: var(--ink-3); font-size: 12.5px; line-height: 1;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+.mic-btn:hover:not(:disabled) { background: var(--surface-sunk); color: var(--ink); }
+.mic-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+.mic-btn.is-listening {
+  background: var(--bad-soft); border-color: var(--bad); color: var(--bad);
+  animation: breathe 1.2s ease-in-out infinite;
+}
+.mic-btn.has-error { background: var(--run-soft); border-color: var(--run); color: var(--run); }
+
 /* -------------------------------- composer ------------------------------- */
 
 .composer { border-top: 1px solid var(--rule); padding: 12px 18px 14px; flex-shrink: 0; }

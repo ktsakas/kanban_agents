@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { api, subscribe } from './api.js';
+import MicButton, { appendDictation } from './MicButton.jsx';
 
 const MODELS = ['claude-opus-5', 'claude-sonnet-5', 'claude-fable-5-1', 'claude-haiku-4-5-20251001'];
 const PERMISSION_MODES = ['default', 'acceptEdits', 'bypassPermissions', 'plan', 'dontAsk'];
@@ -244,6 +245,7 @@ function PermissionPanel({ card, onAnswered }) {
             onChange={(e) => setNote(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && note.trim() && answer('answer', note)}
           />
+          <MicButton title="Dictate answer" onText={(chunk) => setNote((n) => appendDictation(n, chunk))} />
           <button className="btn btn-primary" disabled={!note.trim()} onClick={() => answer('answer', note)}>
             Send
           </button>
@@ -266,6 +268,7 @@ function PermissionPanel({ card, onAnswered }) {
           value={note}
           onChange={(e) => setNote(e.target.value)}
         />
+        <MicButton title="Dictate reason" onText={(chunk) => setNote((n) => appendDictation(n, chunk))} />
         <button className="btn btn-danger" onClick={() => answer('deny', note)}>
           Deny
         </button>
@@ -359,18 +362,21 @@ export default function CardDetail({ card, settings, isRunning, columns, onClose
             <PermissionPanel card={card} onAnswered={onChanged} />
             <Transcript cardId={card.id} isRunning={isRunning} />
             <footer className="composer">
-              <textarea
-                placeholder={
-                  isRunning
-                    ? 'Send a message into the running session...'
-                    : 'Reply to resume this session (it goes to the front of the queue)'
-                }
-                value={reply}
-                onChange={(e) => setReply(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) send();
-                }}
-              />
+              <div className="textarea-wrap">
+                <textarea
+                  placeholder={
+                    isRunning
+                      ? 'Send a message into the running session...'
+                      : 'Reply to resume this session (it goes to the front of the queue)'
+                  }
+                  value={reply}
+                  onChange={(e) => setReply(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) send();
+                  }}
+                />
+                <MicButton title="Dictate reply" onText={(chunk) => setReply((r) => appendDictation(r, chunk))} />
+              </div>
               <div className="composer-actions">
                 <span className="hint">Ctrl+Enter to send</span>
                 <button className="btn" onClick={() => api.reset(card.id).then(onChanged)}>
