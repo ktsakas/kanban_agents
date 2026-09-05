@@ -115,10 +115,12 @@ class Runner {
   }
 
   broadcast() {
+    const settings = store.getSettings();
     emitBoard({
       type: 'board',
-      cards: store.listCards(),
-      settings: store.getSettings(),
+      cards: store.listCards({ project: settings.workingDir }),
+      projects: store.listProjects(),
+      settings,
       runningCardId: this.current?.cardId ?? null,
       auth: checkAuth(),
     });
@@ -155,7 +157,10 @@ class Runner {
     const settings = store.getSettings();
     if (settings.queuePaused) return;
 
-    const cards = store.listCards();
+    // Scoped to the active project: a card queued up under a different
+    // working directory waits until you switch the board back to it, instead
+    // of running unattended against a tree you're not looking at.
+    const cards = store.listCards({ project: settings.workingDir });
     // Only a card that is genuinely waiting on the user holds the queue. A
     // card sitting in Needs Input with nothing pending (e.g. requeued after a
     // restart) is not blocked, and must not stall everything behind it.

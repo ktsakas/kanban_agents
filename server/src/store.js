@@ -23,8 +23,13 @@ export const COLUMNS = [
 
 export const COLUMN_IDS = COLUMNS.map((c) => c.id);
 
+/** Canonical form of a working directory, so cards and settings compare equal. */
+export function resolveDir(dir) {
+  return path.resolve(dir || os.homedir());
+}
+
 const DEFAULT_SETTINGS = {
-  workingDir: process.env.KANBAN_WORKDIR || os.homedir(),
+  workingDir: resolveDir(process.env.KANBAN_WORKDIR),
   model: 'claude-sonnet-5',
   permissionMode: 'acceptEdits',
   effort: 'high',
@@ -46,10 +51,19 @@ function load() {
   try {
     const raw = fs.readFileSync(DB_FILE, 'utf8');
     const parsed = JSON.parse(raw);
+    const settings = { ...DEFAULT_SETTINGS, ...(parsed.settings ?? {}) };
+    settings.workingDir = resolveDir(settings.workingDir);
+    const cards = parsed.cards ?? {};
+    // Migrate cards written before per-project boards existed: pin them to
+    // whichever project they were actually running in, permanently, so they
+    // don't drift the next time the board default is switched.
+    for (const card of Object.values(cards)) {
+      if (!card.projectDir) card.projectDir = resolveDir(card.workingDir || settings.workingDir);
+    }
     return {
       version: 1,
-      cards: parsed.cards ?? {},
-      settings: { ...DEFAULT_SETTINGS, ...(parsed.settings ?? {}) },
+      cards,
+      settings,
     };
   } catch {
     return emptyDb();
@@ -86,23 +100,51 @@ export function getSettings() {
 }
 
 export function updateSettings(patch) {
-  db.settings = { ...db.settings, ...patch };
+  const clean = 'workingDir' in patch ? { ...patch, workingDir: resolveDir(patch.workingDir) } : patch;
+  db.settings = { ...db.settings, ...clean };
   persist();
   return getSettings();
 }
 
 /* --------------------------------- cards --------------------------------- */
 
-export function listCards() {
-  return Object.values(db.cards).sort((a, b) => a.order - b.order);
+/**
+ * All cards, or just the ones belonging to a project (working directory).
+ * The board is scoped to one project at a time - switching the board's
+ * working directory switches which cards are visible, the same way switching
+ * branches switches which files you see.
+ */
+export function listCards({ project } = {}) {
+  const all = Object.values(db.cards).sort((a, b) => a.order - b.order);
+  if (!project) return all;
+  const target = resolveDir(project);
+  return all.filter((c) => (c.projectDir ?? resolveDir(db.settings.workingDir)) === target);
 }
 
 export function getCard(id) {
   return db.cards[id] ?? null;
 }
 
-function nextOrder(column) {
-  const inColumn = listCards().filter((c) => c.column === column);
+/** Distinct projects (working directories) any card has ever run in, most recently touched first. */
+export function listProjects() {
+  const byDir = new Map();
+  for (const card of Object.values(db.cards)) {
+    const dir = card.projectDir ?? resolveDir(db.settings.workingDir);
+    const prev = byDir.get(dir);
+    const touched = card.updatedAt ?? card.createdAt;
+    if (!prev || touched > prev.lastActivity) {
+      byDir.set(dir, { dir, lastActivity: touched, count: (prev?.count ?? 0) + 1 });
+    } else {
+      prev.count += 1;
+    }
+  }
+  const current = resolveDir(db.settings.workingDir);
+  if (!byDir.has(current)) byDir.set(current, { dir: current, lastActivity: null, count: 0 });
+  return [...byDir.values()].sort((a, b) => (b.lastActivity ?? '').localeCompare(a.lastActivity ?? ''));
+}
+
+function nextOrder(column, project) {
+  const inColumn = listCards({ project }).filter((c) => c.column === column);
   return inColumn.length ? Math.max(...inColumn.map((c) => c.order)) + 1 : 0;
 }
 
@@ -116,18 +158,23 @@ function fallbackTitle(prompt) {
 export function createCard(input = {}) {
   const now = new Date().toISOString();
   const column = COLUMN_IDS.includes(input.column) ? input.column : 'backlog';
+  // The project this card belongs to, fixed at creation (or whenever the
+  // working-dir override changes) so it doesn't drift if the board default
+  // is later switched to a different project.
+  const projectDir = resolveDir(input.workingDir || db.settings.workingDir);
   const card = {
     id: randomUUID(),
     title: (input.title ?? '').trim() || fallbackTitle(input.prompt),
     prompt: input.prompt ?? '',
     column,
-    order: nextOrder(column),
+    order: nextOrder(column, projectDir),
     labels: Array.isArray(input.labels) ? input.labels : [],
     // per-card overrides; null means "inherit from settings"
     model: input.model ?? null,
     permissionMode: input.permissionMode ?? null,
     effort: input.effort ?? null,
     workingDir: input.workingDir ?? null,
+    projectDir,
     createdAt: now,
     updatedAt: now,
     startedAt: null,
@@ -154,6 +201,11 @@ export function updateCard(id, patch) {
   const card = db.cards[id];
   if (!card) return null;
   Object.assign(card, patch, { updatedAt: new Date().toISOString() });
+  // Changing the override (including clearing it back to "inherit") moves
+  // the card to whichever project that now resolves to.
+  if ('workingDir' in patch) {
+    card.projectDir = resolveDir(patch.workingDir || db.settings.workingDir);
+  }
   persist();
   return card;
 }
@@ -178,17 +230,20 @@ export function moveCard(id, column, index) {
   const card = db.cards[id];
   if (!card || !COLUMN_IDS.includes(column)) return null;
   const from = card.column;
+  const project = card.projectDir;
   card.column = column;
   card.updatedAt = new Date().toISOString();
 
-  const siblings = listCards().filter((c) => c.column === column && c.id !== id);
+  // Scoped to this card's project: reordering only ever touches cards that
+  // actually share its board, so it can't shuffle another project's queue.
+  const siblings = listCards({ project }).filter((c) => c.column === column && c.id !== id);
   const at = Math.max(0, Math.min(index ?? siblings.length, siblings.length));
   siblings.splice(at, 0, card);
   siblings.forEach((c, i) => {
     c.order = i;
   });
   if (from !== column) {
-    listCards()
+    listCards({ project })
       .filter((c) => c.column === from)
       .forEach((c, i) => {
         c.order = i;

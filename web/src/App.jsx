@@ -199,8 +199,12 @@ export default function App() {
   const [search, setSearch] = useState('');
   const [drag, setDrag] = useState({ cardId: null, overColumn: null, overIndex: null });
   const [theme, setTheme] = useState(() => localStorage.getItem('theme') ?? 'light');
+  const [connected, setConnected] = useState(true);
 
-  useEffect(() => subscribe('/stream/board', setBoard), []);
+  useEffect(
+    () => subscribe('/stream/board', setBoard, (status) => setConnected(status === 'open')),
+    [],
+  );
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -245,6 +249,22 @@ export default function App() {
     await api.createCard({ prompt, column });
   }, []);
 
+  const switchProject = useCallback(async (dir) => {
+    if (!dir || dir === board?.settings?.workingDir) return;
+    await api.updateSettings({ workingDir: dir });
+  }, [board]);
+
+  const [starting, setStarting] = useState(false);
+  const runProject = useCallback(async () => {
+    setStarting(true);
+    try {
+      const card = await api.runProject(board.settings.workingDir);
+      setOpenCardId(card.id);
+    } finally {
+      setStarting(false);
+    }
+  }, [board]);
+
   if (!board) {
     return (
       <div className="boot">
@@ -265,6 +285,14 @@ export default function App() {
       <header className="topbar">
         <div className="brand">
           Kanban <em>Agents</em>
+        </div>
+
+        <div
+          className={`conn-status ${connected ? 'is-connected' : 'is-reconnecting'}`}
+          title={connected ? `Connected to ${window.location.origin}` : 'Lost connection to the server — retrying…'}
+        >
+          <span className="conn-dot" />
+          {connected ? window.location.host : 'Reconnecting…'}
         </div>
 
         <div className={`queue-status ${paused ? 'is-paused' : ''}`}>
@@ -326,10 +354,45 @@ export default function App() {
       )}
 
       <div className="workdir-bar">
-        <code>{board.settings.workingDir}</code>
+        <span className="project-label">Project</span>
+        <select
+          className="select project-select"
+          value={board.settings.workingDir}
+          onChange={(e) => switchProject(e.target.value)}
+          title="Switch which project's board you're looking at"
+        >
+          {(board.projects ?? []).map((p) => (
+            <option key={p.dir} value={p.dir}>
+              {p.dir}
+              {p.count ? ` (${p.count})` : ''}
+            </option>
+          ))}
+        </select>
+        <button className="btn" onClick={() => setShowSettings(true)}>
+          Change&hellip;
+        </button>
+        <span className="sep">&mdash;</span>
+
+        {board.projectRun?.running ? (
+          <a
+            className="project-run is-running"
+            href={board.projectRun.url}
+            target="_blank"
+            rel="noreferrer"
+            title={board.projectRun.command ? `Started with: ${board.projectRun.command}` : 'Open in a new tab'}
+          >
+            <span className="live-dot" /> Running at {board.projectRun.url}
+          </a>
+        ) : (
+          <button className="btn btn-run" onClick={runProject} disabled={starting}>
+            {starting ? 'Starting…' : '▶ Run project'}
+          </button>
+        )}
+
         <span className="sep">&mdash;</span>
         <span className="note">
-          every session runs here, one at a time, building on the last one&rsquo;s changes
+          every session runs here, one at a time, building on the last one&rsquo;s changes. Cards
+          belong to the project they were created in &mdash; switch projects to see theirs.
         </span>
       </div>
 

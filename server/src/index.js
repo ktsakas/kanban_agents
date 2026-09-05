@@ -11,6 +11,7 @@ import { runner } from './runner.js';
 import * as git from './git.js';
 import { checkAuth } from './auth.js';
 import { generateTitle } from './titler.js';
+import * as projectRun from './projectRun.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT ?? 4317);
@@ -23,17 +24,32 @@ const api = express.Router();
 
 /* -------------------------------- board ---------------------------------- */
 
-function boardPayload() {
+async function boardPayload() {
+  const settings = store.getSettings();
   return {
     columns: store.COLUMNS,
-    cards: store.listCards(),
-    settings: store.getSettings(),
+    cards: store.listCards({ project: settings.workingDir }),
+    projects: store.listProjects(),
+    settings,
     runningCardId: runner.current?.cardId ?? null,
     auth: checkAuth(),
+    projectRun: await projectRun.getRunStatus(settings.workingDir),
   };
 }
 
-api.get('/board', (_req, res) => res.json(boardPayload()));
+api.get('/board', async (_req, res) => res.json(await boardPayload()));
+
+/** Liveness/status probe: is the server up, and what is it serving on. */
+api.get('/health', (_req, res) => {
+  res.json({
+    status: 'ok',
+    pid: process.pid,
+    port: PORT,
+    url: `http://localhost:${PORT}`,
+    uptime: process.uptime(),
+    dataDir: store.paths.DATA_DIR,
+  });
+});
 
 api.patch('/settings', (req, res) => {
   const settings = store.updateSettings(req.body ?? {});
@@ -188,6 +204,63 @@ api.get('/git/status', async (req, res) => {
   res.json({ path: dir, snapshot: await git.snapshot(dir) });
 });
 
+/* ------------------------------ run project ------------------------------ */
+
+const RUN_PROJECT_LABEL = 'run-project';
+
+function runProjectPrompt(dir) {
+  const statusPath = projectRun.statusFilePath(dir);
+  return `Get this project running locally so it can be opened in a browser.
+
+Working directory: ${dir}
+
+1. Work out how this project is built and run - check package.json scripts, or
+   whatever the equivalent is for this stack (Python, Go, Rust, a Makefile,
+   etc). Install dependencies first if that hasn't been done yet.
+2. Start its dev/preview server *in the background*, fully detached from this
+   session, so it keeps running after you finish responding (e.g. on Windows,
+   \`start /B\` or spawn detached with output redirected to a log file; on
+   POSIX, \`nohup ... > log 2>&1 & disown\`). Do not run it in the foreground -
+   that would block this task forever.
+3. Confirm it actually answers before reporting success (curl/fetch it).
+4. Write exactly this JSON to exactly this file path (create parent
+   directories if needed), with the real port and command substituted in:
+
+   ${statusPath}
+
+   {"url": "http://localhost:<port>", "command": "<command you used to start it>", "startedAt": "<current ISO timestamp>"}
+
+If there's no sensible way to "run" this project (e.g. it's a library, not an
+app), don't guess - say so in your final message instead of writing that file.`;
+}
+
+/** Kicks off a card that builds/starts whatever project lives in `dir` and reports its URL back. */
+api.post('/projects/run', (req, res) => {
+  const settings = store.getSettings();
+  const dir = store.resolveDir(req.body?.dir || settings.workingDir);
+
+  // Don't pile up duplicate run cards if one's already in flight for this project.
+  const already = store
+    .listCards({ project: dir })
+    .find(
+      (c) =>
+        c.labels?.includes(RUN_PROJECT_LABEL) &&
+        ['backlog', 'in_progress', 'needs_input'].includes(c.column),
+    );
+  if (already) return res.status(200).json(already);
+
+  const card = store.createCard({
+    title: 'Run project',
+    prompt: runProjectPrompt(dir),
+    column: 'in_progress',
+    labels: [RUN_PROJECT_LABEL],
+    workingDir: dir,
+  });
+  runner.broadcast();
+  runner.tick();
+  res.status(201).json(card);
+});
+
 /* ---------------------------------- SSE ---------------------------------- */
 
 function sse(res) {
@@ -205,8 +278,10 @@ function sse(res) {
 
 api.get('/stream/board', (req, res) => {
   const { send, stop } = sse(res);
-  send(boardPayload());
-  const onBoard = () => send(boardPayload());
+  boardPayload().then(send);
+  const onBoard = () => {
+    boardPayload().then(send);
+  };
   bus.on('board', onBoard);
   req.on('close', () => {
     bus.off('board', onBoard);
@@ -241,15 +316,43 @@ if (fs.existsSync(webDist)) {
 runner.recover();
 runner.tick();
 
+// Dropped next to the board data so `npm run status` (server/src/status.js)
+// can tell whether a server is running and where, without a console to read.
+const RUN_FILE = path.join(store.paths.DATA_DIR, 'run.json');
+
+function writeRunFile() {
+  const info = {
+    pid: process.pid,
+    port: PORT,
+    url: `http://localhost:${PORT}`,
+    startedAt: new Date().toISOString(),
+  };
+  try {
+    fs.writeFileSync(RUN_FILE, JSON.stringify(info, null, 2));
+  } catch (err) {
+    console.error('[run-file] failed to write:', err);
+  }
+}
+
+function clearRunFile() {
+  try {
+    fs.rmSync(RUN_FILE, { force: true });
+  } catch {
+    // best-effort
+  }
+}
+
 app.listen(PORT, () => {
   console.log(`kanban-agents server  http://localhost:${PORT}`);
   console.log(`data                  ${store.paths.DATA_DIR}`);
   console.log(`default working dir   ${store.getSettings().workingDir}`);
+  writeRunFile();
 });
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.on(signal, () => {
     store.flush();
+    clearRunFile();
     process.exit(0);
   });
 }

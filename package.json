@@ -8,6 +8,7 @@
     "build": "npm --prefix web run build",
     "start": "npm run build && npm --prefix server start",
     "server": "npm --prefix server start",
-    "web": "npm --prefix web run dev"
+    "web": "npm --prefix web run dev",
+    "status": "npm --prefix server run status"
   }
 }

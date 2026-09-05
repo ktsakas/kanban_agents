@@ -21,6 +21,14 @@ Then open <http://localhost:4317>.
 For UI work, run the two halves separately instead — `npm run server` in one
 terminal and `npm run web` in another (Vite on :5317, proxying to :4317).
 
+```bash
+npm run status
+```
+
+Reports whether the server is running and at which URL, without needing its
+console output — reads the pid/port dropped in the data dir on startup, checks
+the process is still alive, and confirms it's actually answering on `/api/health`.
+
 ### Authentication
 
 Sessions are spawned through the Claude Agent SDK, which uses the same
@@ -94,6 +102,18 @@ the audio to their vendor's speech service to transcribe it — this isn't a
 fully offline/local transcription. The 🎤 button disables itself with an
 explanatory tooltip in browsers that don't support it.
 
+## Projects
+
+The board is scoped to one project (working directory) at a time. Every card
+is pinned to the project it was created in - via the board's default working
+directory at the time, or its own working-directory override - and only that
+project's cards are shown.
+
+Switch projects from the dropdown in the bar under the header, or by changing
+the working directory in Settings. The columns, the queue, and the running
+card all follow: cards from other projects sit untouched until you switch back
+to them, so two projects never race for the same working tree.
+
 ## Settings
 
 Board defaults for working directory, model, permission mode, and effort; where
@@ -107,6 +127,8 @@ Everything lives in `~/.kanban-agents`:
 
 - `board.json` — cards and settings
 - `logs/<card-id>.jsonl` — one transcript per card
+- `run.json` — pid, port, and URL of the currently running server; written on
+  startup, removed on clean shutdown, read by `npm run status`
 
 Set `KANBAN_DATA_DIR` to move it, `PORT` to change the port. Session transcripts
 are also written to `~/.claude/projects` by the CLI itself, so a card's session
@@ -122,6 +144,7 @@ server/src/
   runner.js   the single-slot queue and Agent SDK session driver
   store.js    JSON board + JSONL transcripts
   git.js      before/after snapshots and diffstat
+  status.js   `npm run status` — is the server running, and where
 web/src/
   App.jsx           board, columns, drag and drop
   CardDetail.jsx    transcript, permissions, reply, per-card settings

@@ -30,11 +30,18 @@ export const api = {
   resumeQueue: () => request('/queue/resume', { method: 'POST' }),
 
   dirs: (path) => request(`/fs/dirs?path=${encodeURIComponent(path ?? '')}`),
+  runProject: (dir) => request('/projects/run', { method: 'POST', body: { dir } }),
 };
 
-/** Subscribe to a server-sent event stream; returns an unsubscribe function. */
-export function subscribe(path, onMessage) {
+/**
+ * Subscribe to a server-sent event stream; returns an unsubscribe function.
+ * `onStatus`, if given, is called with 'open' on (re)connect and 'error' the
+ * moment the connection drops — the browser retries automatically underneath.
+ */
+export function subscribe(path, onMessage, onStatus) {
   const source = new EventSource(base + path);
+  source.onopen = () => onStatus?.('open');
+  source.onerror = () => onStatus?.('error');
   source.onmessage = (event) => {
     try {
       onMessage(JSON.parse(event.data));

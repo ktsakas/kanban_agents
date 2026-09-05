@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { api, subscribe } from './api.js';
 import MicButton, { appendDictation } from './MicButton.jsx';
+import Markdown from './Markdown.jsx';
 
 const MODELS = ['claude-opus-5', 'claude-sonnet-5', 'claude-fable-5-1', 'claude-haiku-4-5-20251001'];
 const PERMISSION_MODES = ['default', 'acceptEdits', 'bypassPermissions', 'plan', 'dontAsk'];
@@ -138,7 +139,7 @@ function Transcript({ cardId, isRunning }) {
             return (
               <div key={i} className="ev ev-assistant">
                 {event.subagent && <span className="ev-who">{event.subagent}</span>}
-                <div className="prose">{event.text}</div>
+                <Markdown text={event.text} />
               </div>
             );
           case 'thinking':
@@ -282,10 +283,10 @@ function PermissionPanel({ card, onAnswered }) {
 export default function CardDetail({ card, settings, isRunning, columns, onClose, onChanged }) {
   const [tab, setTab] = useState('session');
   const [reply, setReply] = useState('');
-  const [draft, setDraft] = useState({ title: card.title, prompt: card.prompt });
+  const [draft, setDraft] = useState({ title: card.title, prompt: card.prompt, workingDir: card.workingDir ?? '' });
 
   useEffect(() => {
-    setDraft({ title: card.title, prompt: card.prompt });
+    setDraft({ title: card.title, prompt: card.prompt, workingDir: card.workingDir ?? '' });
   }, [card.id]);
 
   useEffect(() => {
@@ -453,10 +454,18 @@ export default function CardDetail({ card, settings, isRunning, columns, onClose
             <label className="field">
               <span>Working directory override</span>
               <input
-                value={card.workingDir ?? ''}
+                value={draft.workingDir}
                 placeholder={settings.workingDir}
-                onChange={(e) => patch({ workingDir: e.target.value || null })}
+                onChange={(e) => setDraft((d) => ({ ...d, workingDir: e.target.value }))}
+                onBlur={() => {
+                  const next = draft.workingDir.trim() || null;
+                  if (next !== (card.workingDir ?? null)) patch({ workingDir: next });
+                }}
               />
+              <small>
+                Changing this moves the card to that project&rsquo;s board once it&rsquo;s no
+                longer the one showing.
+              </small>
             </label>
 
             <label className="field">
@@ -499,7 +508,7 @@ export default function CardDetail({ card, settings, isRunning, columns, onClose
             {card.lastResult && (
               <>
                 <h4>Final summary</h4>
-                <div className="prose">{card.lastResult}</div>
+                <Markdown text={card.lastResult} />
               </>
             )}
             <h4>Git</h4>
