@@ -1,9 +1,17 @@
 import { randomUUID } from 'node:crypto';
 import { query } from '@anthropic-ai/claude-agent-sdk';
+import { Codex } from '@openai/codex-sdk';
 import * as store from './store.js';
 import { emitBoard, emitCardEvent } from './bus.js';
 import * as git from './git.js';
 import { checkAuth } from './auth.js';
+import { subscriptionEnv } from './agentEnv.js';
+import * as projectRun from './projectRun.js';
+import {
+  isFreshSuccessfulRun,
+  isRunProjectCard,
+  runProjectCompletionColumn,
+} from './runProjectCard.js';
 
 /* --------------------------- streaming input ----------------------------- */
 
@@ -50,6 +58,12 @@ function createInputStream() {
     get pending() {
       return queue.length;
     },
+    take() {
+      const item = queue.shift();
+      if (!item) return null;
+      if (typeof item === 'string') return item;
+      return item.message?.content ?? null;
+    },
   };
 }
 
@@ -75,12 +89,59 @@ function summarizeToolResult(content) {
   }
 }
 
+function codexPermissions(permissionMode) {
+  if (permissionMode === 'plan') {
+    return { sandboxMode: 'read-only', approvalPolicy: 'never' };
+  }
+  if (permissionMode === 'bypassPermissions') {
+    return { sandboxMode: 'danger-full-access', approvalPolicy: 'never' };
+  }
+  // Non-interactive SDK turns cannot pause on a native approval dialog. Keep
+  // normal runs safely inside the project; an action outside that sandbox is
+  // denied and Codex can explain what it needs in its final response.
+  return { sandboxMode: 'workspace-write', approvalPolicy: 'never' };
+}
+
+function truncate(text, max = 4000) {
+  const value = String(text ?? '');
+  return value.length > max ? `${value.slice(0, max)}\n... (truncated)` : value;
+}
+
+function withExtraInstructions(prompt, extra) {
+  if (!extra?.trim()) return prompt;
+  return `${prompt}\n\nAdditional instructions for this session:\n${extra.trim()}`;
+}
+
+function modelMatchesAgent(model, agent) {
+  if (!model) return false;
+  if (agent === 'claude') return !String(model).startsWith('gpt-');
+  return !String(model).startsWith('claude-');
+}
+
 /* -------------------------------- Runner --------------------------------- */
 
 class Runner {
   constructor() {
-    this.current = null;
+    // One live session per project. Projects may run concurrently, while cards
+    // that share a working tree remain strictly sequential.
+    this.currents = new Map();
+    this.startingProjects = new Set();
     this.ticking = false;
+  }
+
+  currentForProject(project) {
+    return this.currents.get(store.resolveDir(project)) ?? null;
+  }
+
+  currentForCard(cardId) {
+    for (const current of this.currents.values()) {
+      if (current.cardId === cardId) return current;
+    }
+    return null;
+  }
+
+  runningCardId(project) {
+    return this.currentForProject(project)?.cardId ?? null;
   }
 
   /* ------------------------------ lifecycle ------------------------------ */
@@ -93,10 +154,30 @@ class Runner {
    * here — so leaving it there would hold the whole queue (pauseOnNeedsInput)
    * on a card that can never unblock itself.
    */
-  recover() {
+  async recover() {
     let changed = false;
     for (const card of store.listCards()) {
       if (['running', 'waiting'].includes(card.runState)) {
+        if (isRunProjectCard(card)) {
+          const status = await projectRun.getRunStatus(card.projectDir);
+          if (isFreshSuccessfulRun(card, status, card.startedAt)) {
+            store.updateCard(card.id, {
+              column: 'done',
+              runState: 'finished',
+              finishedAt: new Date().toISOString(),
+              pendingPermission: null,
+              error: null,
+              unread: true,
+            });
+            store.appendEvent(card.id, {
+              type: 'status',
+              level: 'success',
+              text: 'Recovered completed project run from its verified run-status record.',
+            });
+            changed = true;
+            continue;
+          }
+        }
         store.updateCard(card.id, {
           runState: 'queued',
           pendingPermission: null,
@@ -121,8 +202,8 @@ class Runner {
       cards: store.listCards({ project: settings.workingDir }),
       projects: store.listProjects(),
       settings,
-      runningCardId: this.current?.cardId ?? null,
-      auth: checkAuth(),
+      runningCardId: this.runningCardId(settings.workingDir),
+      auth: checkAuth(settings.agent),
     });
   }
 
@@ -140,27 +221,25 @@ class Runner {
   /* -------------------------------- queue -------------------------------- */
 
   /**
-   * Sequential by construction: exactly one session may hold `this.current`,
-   * so cards in In Progress run strictly one after another on the same tree.
+   * Sequential per project: each working tree gets one execution slot, while
+   * cards belonging to different projects may run concurrently.
    */
   tick() {
     if (this.ticking) return;
     this.ticking = true;
     queueMicrotask(() => {
       this.ticking = false;
-      this.maybeStartNext();
+      for (const { dir } of store.listProjects()) this.maybeStartNext(dir);
     });
   }
 
-  maybeStartNext() {
-    if (this.current) return;
+  maybeStartNext(project) {
+    const projectKey = store.resolveDir(project);
+    if (this.currentForProject(projectKey) || this.startingProjects.has(projectKey)) return;
     const settings = store.getSettings();
     if (settings.queuePaused) return;
 
-    // Scoped to the active project: a card queued up under a different
-    // working directory waits until you switch the board back to it, instead
-    // of running unattended against a tree you're not looking at.
-    const cards = store.listCards({ project: settings.workingDir });
+    const cards = store.listCards({ project });
     // Only a card that is genuinely waiting on the user holds the queue. A
     // card sitting in Needs Input with nothing pending (e.g. requeued after a
     // restart) is not blocked, and must not stall everything behind it.
@@ -176,9 +255,15 @@ class Runner {
       .sort((a, b) => a.order - b.order)[0];
 
     if (!next) return;
-    this.runCard(next.id).catch((err) => {
-      console.error('[runner] unhandled', err);
-    });
+    this.startingProjects.add(projectKey);
+    this.runCard(next.id)
+      .catch((err) => {
+        console.error('[runner] unhandled', err);
+      })
+      .finally(() => {
+        this.startingProjects.delete(projectKey);
+        this.tick();
+      });
   }
 
   /* ------------------------------- running ------------------------------- */
@@ -189,16 +274,42 @@ class Runner {
 
     const settings = store.getSettings();
     const cwd = card.workingDir || settings.workingDir;
-    const model = card.model || settings.model;
+    const project = store.resolveDir(card.projectDir || cwd);
+    if (this.currentForProject(project)) return;
+    const agent = card.sessionAgent || card.agent || settings.agent || 'claude';
+    const model =
+      (modelMatchesAgent(card.model, agent) ? card.model : null) ||
+      card.sessionModel ||
+      (agent === settings.agent ? settings.model : agent === 'codex' ? '' : 'claude-sonnet-5');
     const permissionMode = card.permissionMode || settings.permissionMode;
     const effort = card.effort || settings.effort;
 
+    let changeSnapshot = card.changeSnapshot;
+    if (!changeSnapshot) {
+      try {
+        changeSnapshot = await git.captureSessionStart(cwd, cardId);
+      } catch (err) {
+        store.updateCard(cardId, {
+          column: isRunProjectCard(card) ? 'done' : 'needs_input',
+          runState: 'error',
+          error: `Could not create the rollback snapshot: ${err?.message || String(err)}`,
+        });
+        this.broadcast();
+        return;
+      }
+    }
+
     const isFollowUp = Boolean(card.sessionId && card.pendingReply);
-    const prompt = isFollowUp ? card.pendingReply : card.prompt || card.title;
+    const basePrompt = card.prompt || card.title;
+    const prompt = card.pendingReply
+      ? card.sessionId
+        ? card.pendingReply
+        : `${basePrompt}\n\nAdditional user message:\n${card.pendingReply}`
+      : basePrompt;
 
     if (!prompt || !prompt.trim()) {
       store.updateCard(cardId, {
-        column: 'needs_input',
+        column: isRunProjectCard(card) ? 'done' : 'needs_input',
         runState: 'error',
         error: 'This card has no prompt. Add one and move it back to In Progress.',
       });
@@ -209,7 +320,12 @@ class Runner {
     const input = createInputStream();
     const abort = new AbortController();
     const permissions = new Map();
-    this.current = { cardId, q: null, input, abort, permissions };
+    let resolveDone;
+    const done = new Promise((resolve) => {
+      resolveDone = resolve;
+    });
+    const current = { cardId, project, agent, q: null, input, abort, permissions, done };
+    this.currents.set(project, current);
 
     const gitBefore = await git.snapshot(cwd);
 
@@ -221,7 +337,11 @@ class Runner {
       error: null,
       pendingPermission: null,
       pendingReply: null,
+      sessionAgent: agent,
+      sessionModel: model || null,
       gitBefore: gitBefore ?? card.gitBefore,
+      changeSnapshot,
+      changesRevertedAt: null,
       runCount: (card.runCount ?? 0) + 1,
       unread: false,
     });
@@ -229,8 +349,8 @@ class Runner {
       type: 'status',
       level: 'info',
       text: isFollowUp
-        ? `Resuming session in ${cwd}`
-        : `Starting session in ${cwd} (${model}, ${permissionMode})`,
+        ? `Resuming ${agent === 'codex' ? 'Codex' : 'Claude Code'} session in ${cwd}`
+        : `Starting ${agent === 'codex' ? 'Codex' : 'Claude Code'} session in ${cwd} (${model || 'configured default'}, ${permissionMode})`,
     });
     this.record(cardId, { type: 'user_prompt', text: prompt });
     this.broadcast();
@@ -247,7 +367,10 @@ class Runner {
       forwardSubagentText: true,
       canUseTool: (toolName, toolInput, opts) =>
         this.askPermission(cardId, toolName, toolInput, opts),
-      env: { ...process.env, CLAUDE_AGENT_SDK_CLIENT_APP: 'kanban-agents/1.0' },
+      env: {
+        ...subscriptionEnv('claude'),
+        CLAUDE_AGENT_SDK_CLIENT_APP: 'kanban-agents/1.0',
+      },
     };
     if (permissionMode === 'bypassPermissions') options.allowDangerouslySkipPermissions = true;
     if (settings.maxTurns > 0) options.maxTurns = settings.maxTurns;
@@ -264,17 +387,30 @@ class Runner {
     let failure = null;
 
     try {
-      const q = query({ prompt: input.iterable, options });
-      this.current.q = q;
+      if (agent === 'codex') {
+        finalResult = await this.runCodex(cardId, {
+          card,
+          cwd,
+          model,
+          permissionMode,
+          effort,
+          settings,
+          input,
+          abort,
+        });
+      } else {
+        const q = query({ prompt: input.iterable, options });
+        current.q = q;
 
-      for await (const message of q) {
-        if (this.current?.cardId !== cardId) break;
-        const res = this.handleMessage(cardId, message);
-        if (res) finalResult = res;
+        for await (const message of q) {
+          if (this.currentForProject(project) !== current) break;
+          const res = this.handleMessage(cardId, message);
+          if (res) finalResult = res;
 
-        if (message.type === 'result') {
-          // Turn complete. Close input unless a reply arrived while it ran.
-          if (!input.pending) input.close();
+          if (message.type === 'result') {
+            // Turn complete. Close input unless a reply arrived while it ran.
+            if (!input.pending) input.close();
+          }
         }
       }
     } catch (err) {
@@ -289,10 +425,191 @@ class Runner {
     }
 
     const wasAborted = abort.signal.aborted;
-    if (this.current?.cardId === cardId) this.current = null;
+    if (this.currentForProject(project) === current) this.currents.delete(project);
 
-    await this.finish(cardId, { finalResult, failure, wasAborted, cwd, gitBefore });
-    this.tick();
+    try {
+      await this.finish(cardId, { finalResult, failure, wasAborted, cwd, gitBefore });
+      this.tick();
+    } finally {
+      resolveDone();
+    }
+  }
+
+  async runCodex(cardId, { card, cwd, model, permissionMode, effort, settings, input, abort }) {
+    // Intentionally omit `apiKey`: the SDK launches its bundled Codex CLI,
+    // which reuses the user's cached `codex login` (ChatGPT subscription).
+    const codex = new Codex({ env: subscriptionEnv('codex') });
+    const threadOptions = {
+      workingDirectory: cwd,
+      skipGitRepoCheck: true,
+      modelReasoningEffort: effort,
+      ...codexPermissions(permissionMode),
+    };
+    if (model) threadOptions.model = model;
+    const thread = card.sessionId
+      ? codex.resumeThread(card.sessionId, threadOptions)
+      : codex.startThread(threadOptions);
+    const current = this.currentForCard(cardId);
+    if (current) current.thread = thread;
+
+    const started = Date.now();
+    const usage = {
+      input_tokens: 0,
+      cached_input_tokens: 0,
+      cache_write_input_tokens: 0,
+      output_tokens: 0,
+      reasoning_output_tokens: 0,
+    };
+    let numTurns = 0;
+    let finalText = '';
+
+    // A reply submitted during a Codex turn is queued here and starts as the
+    // next turn on the same thread as soon as the current turn completes.
+    for (let prompt = input.take(); prompt; prompt = input.take()) {
+      const { events } = await thread.runStreamed(
+        withExtraInstructions(prompt, settings.appendSystemPrompt),
+        { signal: abort.signal },
+      );
+      const toolIds = new Set();
+      let turnText = '';
+      let turnUsage = null;
+      let turnFailure = null;
+      let verifiedRunProjectCompletion = false;
+
+      for await (const event of events) {
+        if (this.currentForCard(cardId) !== current) break;
+
+        if (event.type === 'thread.started') {
+          store.updateCard(cardId, {
+            sessionId: event.thread_id,
+            sessionAgent: 'codex',
+            sessionModel: model || null,
+          });
+          this.record(cardId, {
+            type: 'session',
+            sessionId: event.thread_id,
+            agent: 'codex',
+            model: model || 'Codex default',
+            tools: null,
+          });
+          this.broadcast();
+        } else if (event.type === 'item.started') {
+          const tool = this.codexToolEvent(event.item);
+          if (tool) {
+            toolIds.add(event.item.id);
+            this.record(cardId, tool);
+          }
+        } else if (event.type === 'item.completed') {
+          const item = event.item;
+          if (item.type === 'agent_message' && item.text?.trim()) {
+            turnText = item.text;
+            this.record(cardId, { type: 'text', text: item.text });
+            if (isRunProjectCard(card)) {
+              const status = await projectRun.getRunStatus(cwd);
+              verifiedRunProjectCompletion = isFreshSuccessfulRun(card, status, started);
+              if (verifiedRunProjectCompletion) {
+                this.record(cardId, {
+                  type: 'status',
+                  level: 'success',
+                  text: 'Project is running - closing the completed control session.',
+                });
+                break;
+              }
+            }
+          } else if (item.type === 'reasoning' && item.text?.trim()) {
+            this.record(cardId, { type: 'thinking', text: item.text });
+          } else if (item.type === 'error') {
+            this.record(cardId, { type: 'status', level: 'warn', text: item.message });
+          } else {
+            const tool = toolIds.has(item.id) ? null : this.codexToolEvent(item);
+            if (tool) this.record(cardId, tool);
+            const result = this.codexToolResult(item);
+            if (result) this.record(cardId, result);
+          }
+        } else if (event.type === 'turn.completed') {
+          turnUsage = event.usage;
+        } else if (event.type === 'turn.failed') {
+          turnFailure = event.error?.message || 'Codex turn failed.';
+        } else if (event.type === 'error') {
+          turnFailure = event.message || 'Codex session failed.';
+        }
+      }
+
+      if (turnFailure) throw new Error(turnFailure);
+      numTurns += 1;
+      finalText = turnText || finalText;
+      for (const key of Object.keys(usage)) usage[key] += turnUsage?.[key] ?? 0;
+      this.record(cardId, {
+        type: 'result',
+        subtype: 'success',
+        isError: false,
+        text: turnText,
+        durationMs: Date.now() - started,
+        numTurns,
+        costUsd: null,
+        usage: turnUsage,
+      });
+    }
+
+    return {
+      subtype: 'success',
+      is_error: false,
+      result: finalText,
+      duration_ms: Date.now() - started,
+      num_turns: numTurns,
+      total_cost_usd: null,
+      usage,
+    };
+  }
+
+  codexToolEvent(item) {
+    switch (item?.type) {
+      case 'command_execution':
+        return { type: 'tool_use', id: item.id, name: 'Shell', input: { command: item.command } };
+      case 'file_change':
+        return { type: 'tool_use', id: item.id, name: 'File changes', input: { changes: item.changes } };
+      case 'mcp_tool_call':
+        return {
+          type: 'tool_use',
+          id: item.id,
+          name: `${item.server}.${item.tool}`,
+          input: item.arguments,
+        };
+      case 'web_search':
+        return { type: 'tool_use', id: item.id, name: 'Web search', input: { query: item.query } };
+      default:
+        return null;
+    }
+  }
+
+  codexToolResult(item) {
+    switch (item?.type) {
+      case 'command_execution':
+        return {
+          type: 'tool_result',
+          toolUseId: item.id,
+          isError: item.status === 'failed' || (item.exit_code != null && item.exit_code !== 0),
+          text: truncate(item.aggregated_output),
+        };
+      case 'file_change':
+        return {
+          type: 'tool_result',
+          toolUseId: item.id,
+          isError: item.status === 'failed',
+          text: item.changes?.map((change) => `${change.kind}: ${change.path}`).join('\n') || '',
+        };
+      case 'mcp_tool_call':
+        return {
+          type: 'tool_result',
+          toolUseId: item.id,
+          isError: item.status === 'failed',
+          text: truncate(item.error?.message || summarizeToolResult(item.result?.content)),
+        };
+      case 'web_search':
+        return { type: 'tool_result', toolUseId: item.id, isError: false, text: item.query || '' };
+      default:
+        return null;
+    }
   }
 
   handleMessage(cardId, message) {
@@ -405,7 +722,7 @@ class Runner {
     };
 
     store.updateCard(cardId, {
-      column: 'needs_input',
+      column: isRunProjectCard(store.getCard(cardId)) ? 'in_progress' : 'needs_input',
       runState: 'waiting',
       pendingPermission: request,
       unread: true,
@@ -415,7 +732,7 @@ class Runner {
 
     return new Promise((resolve) => {
       const settle = (result) => {
-        this.current?.permissions.delete(requestId);
+        this.currentForCard(cardId)?.permissions.delete(requestId);
         const card = store.getCard(cardId);
         if (card && card.runState === 'waiting') {
           store.updateCard(cardId, {
@@ -427,7 +744,7 @@ class Runner {
         }
         resolve(result);
       };
-      this.current?.permissions.set(requestId, { resolve: settle, request });
+      this.currentForCard(cardId)?.permissions.set(requestId, { resolve: settle, request });
 
       opts?.signal?.addEventListener(
         'abort',
@@ -438,8 +755,9 @@ class Runner {
   }
 
   answerPermission(cardId, requestId, decision, payload = {}) {
-    if (this.current?.cardId !== cardId) return false;
-    const entry = this.current.permissions.get(requestId);
+    const current = this.currentForCard(cardId);
+    if (!current) return false;
+    const entry = current.permissions.get(requestId);
     if (!entry) return false;
 
     if (decision === 'allow') {
@@ -482,17 +800,18 @@ class Runner {
     const card = store.getCard(cardId);
     if (!card || !text || !text.trim()) return false;
 
-    if (this.current?.cardId === cardId) {
-      const pending = [...this.current.permissions.entries()][0];
+    const current = this.currentForCard(cardId);
+    if (current) {
+      const pending = [...current.permissions.entries()][0];
       if (pending) {
         const [requestId, entry] = pending;
         const kind = entry.request.kind;
         this.answerPermission(cardId, requestId, kind === 'question' ? 'answer' : 'deny', { text });
-        if (kind !== 'question') this.current.input.push(text);
+        if (kind !== 'question') current.input.push(text);
         return true;
       }
       this.record(cardId, { type: 'user_prompt', text });
-      this.current.input.push(text);
+      current.input.push(text);
       store.updateCard(cardId, { column: 'in_progress', runState: 'running' });
       this.broadcast();
       return true;
@@ -514,24 +833,28 @@ class Runner {
   /* -------------------------------- control ------------------------------ */
 
   async stop(cardId) {
-    if (this.current?.cardId !== cardId) return false;
+    const current = this.currentForCard(cardId);
+    if (!current) return false;
     this.record(cardId, { type: 'status', level: 'warn', text: 'Stopped by user.' });
-    for (const [requestId] of this.current.permissions) {
+    for (const [requestId] of current.permissions) {
       this.answerPermission(cardId, requestId, 'deny', { text: 'Session stopped by the user.' });
     }
     try {
-      await this.current.q?.interrupt();
+      await current.q?.interrupt();
     } catch {
       /* interrupt is best effort; the abort below always lands */
     }
-    this.current.abort.abort();
-    this.current.input.close();
+    current.abort.abort();
+    current.input.close();
     return true;
   }
 
   /** Called when a card is dragged out of In Progress while it is running. */
   async cancelIfRunning(cardId) {
-    if (this.current?.cardId === cardId) await this.stop(cardId);
+    const running = this.currentForCard(cardId);
+    if (!running) return;
+    await this.stop(cardId);
+    await running.done;
   }
 
   async finish(cardId, { finalResult, failure, wasAborted, cwd, gitBefore }) {
@@ -539,13 +862,24 @@ class Runner {
     if (!card) return;
 
     const settings = store.getSettings();
+    const isProjectRunner = isRunProjectCard(card);
     const gitAfter = await git.snapshot(cwd);
     const diffStat = await git.diffSince(cwd, gitBefore?.head);
+
+    let changeSnapshot = card.changeSnapshot;
+    if (changeSnapshot) {
+      try {
+        changeSnapshot = await git.captureSessionEnd(changeSnapshot);
+      } catch (err) {
+        failure ||= `Could not finish the rollback snapshot: ${err?.message || String(err)}`;
+      }
+    }
 
     const patch = {
       finishedAt: new Date().toISOString(),
       gitAfter,
       diffStat,
+      changeSnapshot,
       pendingPermission: null,
     };
 
@@ -565,26 +899,38 @@ class Runner {
 
     if (wasAborted) {
       patch.runState = 'stopped';
-      if (!movedAway) patch.column = 'needs_input';
+      if (!movedAway) patch.column = isProjectRunner ? 'done' : 'needs_input';
       patch.unread = true;
     } else if (failure || finalResult?.is_error) {
       patch.runState = 'error';
       patch.error = failure || finalResult?.result || 'The session ended with an error.';
-      if (!movedAway) patch.column = 'needs_input';
+      if (!movedAway) patch.column = isProjectRunner ? 'done' : 'needs_input';
       patch.unread = true;
-      if (/authenticat|401|oauth/i.test(patch.error)) {
-        patch.error = `${patch.error}\n\nRun "claude" in a terminal and log in (or set ANTHROPIC_API_KEY), then reply here to retry.`;
+      if (/authenticat|401|oauth|log(?:ged)? in/i.test(patch.error)) {
+        const agent = card.sessionAgent || 'claude';
+        const command = agent === 'codex' ? 'npm run login:codex' : 'claude';
+        const name = agent === 'codex' ? 'ChatGPT' : 'your Claude subscription';
+        patch.error = `${patch.error}\n\nRun "${command}" in a terminal and log in with ${name}, then reply here to retry.`;
+      }
+      if (
+        card.sessionAgent === 'codex' &&
+        /selected model|may not exist|access to it/i.test(patch.error)
+      ) {
+        patch.model = null;
+        patch.sessionModel = null;
+        patch.error = `${patch.error}\n\nThe explicit model override was cleared. Reply here to retry with your Codex configured default.`;
       }
       this.record(cardId, { type: 'status', level: 'error', text: patch.error });
     } else {
       patch.runState = 'finished';
       patch.error = null;
-      if (!movedAway) patch.column = settings.autoAdvanceTo;
+      const completedColumn = runProjectCompletionColumn(card, settings.autoAdvanceTo);
+      if (!movedAway) patch.column = completedColumn;
       patch.unread = true;
       this.record(cardId, {
         type: 'status',
         level: 'success',
-        text: `Session complete -> ${settings.autoAdvanceTo}`,
+        text: `Session complete -> ${completedColumn}`,
       });
     }
 

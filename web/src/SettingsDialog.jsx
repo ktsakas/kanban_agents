@@ -1,7 +1,18 @@
 import React, { useEffect, useState } from 'react';
 import { api } from './api.js';
 
-const MODELS = ['claude-opus-5', 'claude-sonnet-5', 'claude-fable-5-1', 'claude-haiku-4-5-20251001'];
+const AGENTS = {
+  claude: {
+    label: 'Claude Code',
+    defaultModel: 'claude-sonnet-5',
+    models: ['claude-opus-5', 'claude-sonnet-5', 'claude-fable-5-1', 'claude-haiku-4-5-20251001'],
+  },
+  codex: {
+    label: 'Codex',
+    defaultModel: '',
+    models: ['', 'gpt-5.6', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-6-astra', 'gpt-5.5'],
+  },
+};
 const PERMISSION_MODES = ['default', 'acceptEdits', 'bypassPermissions', 'plan', 'dontAsk'];
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 
@@ -56,7 +67,7 @@ function DirPicker({ value, onPick, onClose }) {
 }
 
 export default function SettingsDialog({ settings, onClose, onSave }) {
-  const [form, setForm] = useState(settings);
+  const [form, setForm] = useState({ ...settings, agent: settings.agent ?? 'claude' });
   const [picking, setPicking] = useState(false);
   const set = (patch) => setForm((f) => ({ ...f, ...patch }));
 
@@ -96,11 +107,26 @@ export default function SettingsDialog({ settings, onClose, onSave }) {
 
           <div className="field-row">
             <label className="field">
+              <span>Agent</span>
+              <select
+                className="select"
+                value={form.agent}
+                onChange={(e) => {
+                  const agent = e.target.value;
+                  set({ agent, model: AGENTS[agent].defaultModel });
+                }}
+              >
+                {Object.entries(AGENTS).map(([value, config]) => (
+                  <option key={value} value={value}>{config.label}</option>
+                ))}
+              </select>
+            </label>
+            <label className="field">
               <span>Default model</span>
               <select className="select" value={form.model} onChange={(e) => set({ model: e.target.value })}>
-                {MODELS.map((m) => (
+                {AGENTS[form.agent].models.map((m) => (
                   <option key={m} value={m}>
-                    {m}
+                    {m || 'Codex configured default'}
                   </option>
                 ))}
               </select>

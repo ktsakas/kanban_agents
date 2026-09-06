@@ -3,7 +3,10 @@ import { api, subscribe } from './api.js';
 import MicButton, { appendDictation } from './MicButton.jsx';
 import Markdown from './Markdown.jsx';
 
-const MODELS = ['claude-opus-5', 'claude-sonnet-5', 'claude-fable-5-1', 'claude-haiku-4-5-20251001'];
+const MODELS = {
+  claude: ['claude-opus-5', 'claude-sonnet-5', 'claude-fable-5-1', 'claude-haiku-4-5-20251001'],
+  codex: ['gpt-5.6', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-6-astra', 'gpt-5.5'],
+};
 const PERMISSION_MODES = ['default', 'acceptEdits', 'bypassPermissions', 'plan', 'dontAsk'];
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 
@@ -70,7 +73,7 @@ function Thinking({ text }) {
   );
 }
 
-function Transcript({ cardId, isRunning }) {
+function Transcript({ cardId, isRunning, hideMetrics = false }) {
   const [events, setEvents] = useState([]);
   const [live, setLive] = useState({ text: '', thinking: '' });
   const scrollRef = useRef(null);
@@ -151,7 +154,7 @@ function Transcript({ cardId, isRunning }) {
           case 'permission_request':
             return (
               <div key={i} className="ev ev-permission">
-                {event.kind === 'question' ? 'Claude asked you a question' : `Permission requested: ${event.title || event.toolName}`}
+                {event.kind === 'question' ? 'The agent asked you a question' : `Permission requested: ${event.title || event.toolName}`}
               </div>
             );
           case 'permission_resolved':
@@ -164,17 +167,20 @@ function Transcript({ cardId, isRunning }) {
           case 'session':
             return (
               <div key={i} className="ev ev-note">
-                Session {String(event.sessionId).slice(0, 8)} &middot; {event.model} &middot; {event.tools} tools
+                Session {String(event.sessionId).slice(0, 8)} &middot; {event.model}
+                {event.tools != null && <> &middot; {event.tools} tools</>}
               </div>
             );
           case 'result':
             return (
               <div key={i} className={`ev ev-result ${event.isError ? 'is-error' : ''}`}>
-                <b>{event.isError ? 'Ended with error' : 'Turn complete'}</b>
-                <span>
-                  {duration(event.durationMs)} &middot; {turns(event.numTurns)}
-                  {event.costUsd ? ` · ${cost(event.costUsd)}` : ''}
-                </span>
+                <b>{event.isError ? 'Ended with error' : hideMetrics ? 'Run complete' : 'Turn complete'}</b>
+                {!hideMetrics && (
+                  <span>
+                    {duration(event.durationMs)} &middot; {turns(event.numTurns)}
+                    {event.costUsd ? ` · ${cost(event.costUsd)}` : ''}
+                  </span>
+                )}
               </div>
             );
           case 'status':
@@ -226,7 +232,7 @@ function PermissionPanel({ card, onAnswered }) {
   if (request.kind === 'question') {
     return (
       <div className="permission">
-        <h4>Claude needs an answer</h4>
+        <h4>The agent needs an answer</h4>
         {(request.questions ?? []).map((q, qi) => (
           <div key={qi} className="question">
             <p className="question-text">{q.question}</p>
@@ -257,7 +263,7 @@ function PermissionPanel({ card, onAnswered }) {
 
   return (
     <div className="permission">
-      <h4>{request.title || `Claude wants to use ${request.toolName}`}</h4>
+      <h4>{request.title || `The agent wants to use ${request.toolName}`}</h4>
       {request.description && <p className="permission-desc">{request.description}</p>}
       <pre className="code">{JSON.stringify(request.input, null, 2)}</pre>
       <div className="permission-actions">
@@ -280,7 +286,7 @@ function PermissionPanel({ card, onAnswered }) {
 
 /* -------------------------------- detail --------------------------------- */
 
-export default function CardDetail({ card, settings, isRunning, columns, onClose, onChanged }) {
+export default function CardDetail({ card, settings, isRunning, hasRunningTask, columns, onClose, onChanged }) {
   const [tab, setTab] = useState('session');
   const [reply, setReply] = useState('');
   const [draft, setDraft] = useState({ title: card.title, prompt: card.prompt, workingDir: card.workingDir ?? '' });
@@ -304,6 +310,17 @@ export default function CardDetail({ card, settings, isRunning, columns, onClose
   };
 
   const patch = (p) => api.updateCard(card.id, p).then(onChanged);
+  const sessionAgent = card.sessionAgent || settings.agent || 'claude';
+  const modelChoices = MODELS[sessionAgent] || MODELS.claude;
+  const hasRun = Boolean(card.sessionId || card.startedAt);
+  const runModel = hasRun ? card.sessionModel : card.model || settings.model;
+  const runModelLabel = runModel || `${sessionAgent === 'codex' ? 'Codex' : 'Claude'} default`;
+  const runModelVerb = isRunning ? 'Running' : hasRun ? 'Ran' : 'Will run';
+  const isProjectRunner = card.kind === 'run_project' ||
+    (card.kind == null && card.title === 'Run project' && card.labels?.includes('run-project'));
+  const isReverting = card.runState === 'reverting';
+  const moveLocked = isProjectRunner && hasRunningTask;
+  const visibleTabs = isProjectRunner ? ['session', 'changes'] : ['session', 'task', 'changes'];
 
   return (
     <>
@@ -312,9 +329,10 @@ export default function CardDetail({ card, settings, isRunning, columns, onClose
         <header className="drawer-head">
           <input
             className="drawer-title"
+            readOnly={isProjectRunner}
             value={draft.title}
             onChange={(e) => setDraft((d) => ({ ...d, title: e.target.value }))}
-            onBlur={() => draft.title !== card.title && patch({ title: draft.title })}
+            onBlur={() => !isProjectRunner && draft.title !== card.title && patch({ title: draft.title })}
           />
           <div className="drawer-head-actions">
             {isRunning && (
@@ -325,10 +343,27 @@ export default function CardDetail({ card, settings, isRunning, columns, onClose
             <select
               className="select"
               value={card.column}
+              disabled={isRunning || isReverting || moveLocked}
+              title={
+                isRunning
+                  ? 'Stop the running card before moving it'
+                  : moveLocked
+                    ? 'Stop the running task before moving Run project'
+                  : isReverting
+                    ? 'Changes are being reverted'
+                    : undefined
+              }
               onChange={(e) => api.moveCard(card.id, e.target.value, 0).then(onChanged)}
             >
               {columns.map((c) => (
-                <option key={c.id} value={c.id}>
+                <option
+                  key={c.id}
+                  value={c.id}
+                  disabled={
+                    c.id === 'needs_input' ||
+                    (isProjectRunner && !['in_progress', 'done'].includes(c.id))
+                  }
+                >
                   {c.title}
                 </option>
               ))}
@@ -340,13 +375,16 @@ export default function CardDetail({ card, settings, isRunning, columns, onClose
         </header>
 
         <nav className="tabs">
-          {['session', 'task', 'changes'].map((t) => (
+          {visibleTabs.map((t) => (
             <button key={t} className={tab === t ? 'tab is-active' : 'tab'} onClick={() => setTab(t)}>
               {t}
             </button>
           ))}
           <span className="tabs-spacer" />
-          {card.stats && (
+          <span className="tabs-model" title={`${runModelVerb} with ${runModelLabel}`}>
+            {runModelVerb} with <b>{runModelLabel}</b>
+          </span>
+          {!isProjectRunner && card.stats && (
             <span className="tabs-stats">
               {duration(card.stats.durationMs)} &middot; {turns(card.stats.numTurns)}
               {card.stats.costUsd ? ` · ${cost(card.stats.costUsd)}` : ''}
@@ -361,12 +399,15 @@ export default function CardDetail({ card, settings, isRunning, columns, onClose
         {tab === 'session' && (
           <>
             <PermissionPanel card={card} onAnswered={onChanged} />
-            <Transcript cardId={card.id} isRunning={isRunning} />
+            <Transcript cardId={card.id} isRunning={isRunning} hideMetrics={isProjectRunner} />
             <footer className="composer">
               <div className="textarea-wrap">
                 <textarea
+                  disabled={isReverting}
                   placeholder={
-                    isRunning
+                    isReverting
+                      ? 'Changes are being reverted...'
+                      : isRunning
                       ? 'Send a message into the running session...'
                       : 'Reply to resume this session (it goes to the front of the queue)'
                   }
@@ -380,10 +421,10 @@ export default function CardDetail({ card, settings, isRunning, columns, onClose
               </div>
               <div className="composer-actions">
                 <span className="hint">Ctrl+Enter to send</span>
-                <button className="btn" onClick={() => api.reset(card.id).then(onChanged)}>
+                <button className="btn" disabled={isReverting} onClick={() => api.reset(card.id).then(onChanged)}>
                   Reset session
                 </button>
-                <button className="btn btn-primary" disabled={!reply.trim()} onClick={send}>
+                <button className="btn btn-primary" disabled={isReverting || !reply.trim()} onClick={send}>
                   Send
                 </button>
               </div>
@@ -411,8 +452,17 @@ export default function CardDetail({ card, settings, isRunning, columns, onClose
                   value={card.model ?? ''}
                   onChange={(e) => patch({ model: e.target.value || null })}
                 >
-                  <option value="">Board default ({settings.model})</option>
-                  {MODELS.map((m) => (
+                  <option value="">
+                    {card.sessionModel
+                      ? `Session default (${card.sessionModel})`
+                      : settings.model
+                        ? `Board default (${settings.model})`
+                        : 'Board default (Codex configured default)'}
+                  </option>
+                  {card.model && !modelChoices.includes(card.model) && (
+                    <option value={card.model}>{card.model}</option>
+                  )}
+                  {modelChoices.map((m) => (
                     <option key={m} value={m}>
                       {m}
                     </option>

@@ -1,4 +1,6 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
+import { Codex } from '@openai/codex-sdk';
+import { subscriptionEnv } from './agentEnv.js';
 
 /**
  * Turns a task description into a short card title. Runs a one-shot,
@@ -25,11 +27,27 @@ function cleanTitle(raw) {
   return title;
 }
 
-export async function generateTitle(description) {
+export async function generateTitle(description, { agent = 'claude', model, cwd } = {}) {
   const text = (description ?? '').trim();
   if (!text) return null;
 
   try {
+    if (agent === 'codex') {
+      const codex = new Codex({ env: subscriptionEnv('codex') });
+      const thread = codex.startThread({
+        model,
+        workingDirectory: cwd,
+        skipGitRepoCheck: true,
+        sandboxMode: 'read-only',
+        approvalPolicy: 'never',
+        modelReasoningEffort: 'low',
+      });
+      const result = await thread.run(
+        `${SYSTEM_PROMPT}\n\nTask description:\n"""\n${text.slice(0, 4000)}\n"""\n\nTitle:`,
+      );
+      return cleanTitle(result.finalResponse);
+    }
+
     const q = query({
       prompt: `Task description:\n"""\n${text.slice(0, 4000)}\n"""\n\nTitle:`,
       options: {
@@ -38,6 +56,7 @@ export async function generateTitle(description) {
         allowedTools: [],
         permissionMode: 'bypassPermissions',
         systemPrompt: SYSTEM_PROMPT,
+        env: subscriptionEnv('claude'),
       },
     });
 

@@ -2,6 +2,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { randomUUID } from 'node:crypto';
+import {
+  runProjectPinnedIndex,
+  sortRunProjectCardFirst,
+} from './runProjectCard.js';
 
 const DATA_DIR = process.env.KANBAN_DATA_DIR
   ? path.resolve(process.env.KANBAN_DATA_DIR)
@@ -22,6 +26,7 @@ export const COLUMNS = [
 ];
 
 export const COLUMN_IDS = COLUMNS.map((c) => c.id);
+export const USER_COLUMN_IDS = COLUMN_IDS.filter((id) => id !== 'needs_input');
 
 /** Canonical form of a working directory, so cards and settings compare equal. */
 export function resolveDir(dir) {
@@ -30,6 +35,7 @@ export function resolveDir(dir) {
 
 const DEFAULT_SETTINGS = {
   workingDir: resolveDir(process.env.KANBAN_WORKDIR),
+  agent: 'claude',
   model: 'claude-sonnet-5',
   permissionMode: 'acceptEdits',
   effort: 'high',
@@ -44,7 +50,36 @@ const DEFAULT_SETTINGS = {
 };
 
 function emptyDb() {
-  return { cards: {}, settings: { ...DEFAULT_SETTINGS }, version: 1 };
+  return { cards: {}, settings: { ...DEFAULT_SETTINGS }, version: 3 };
+}
+
+/**
+ * Recover the durable rollback marker written by builds that logged a
+ * successful undo but did not yet persist that fact on the card itself.
+ * A later user prompt means the session ran again, so the old marker no
+ * longer applies.
+ */
+function revertedAtFromLog(cardId) {
+  try {
+    const lines = fs.readFileSync(logPath(cardId), 'utf8').split('\n').filter(Boolean);
+    let revertedAt = null;
+    for (const line of lines) {
+      const event = JSON.parse(line);
+      if (event.type === 'user_prompt') revertedAt = null;
+      if (
+        event.type === 'status' &&
+        event.level === 'warn' &&
+        /^Moved to Cancelled .+ session (?:were reverted|made no filesystem changes)\.$/.test(
+          event.text ?? '',
+        )
+      ) {
+        revertedAt = event.ts ?? new Date(0).toISOString();
+      }
+    }
+    return revertedAt;
+  } catch {
+    return null;
+  }
 }
 
 function load() {
@@ -52,6 +87,13 @@ function load() {
     const raw = fs.readFileSync(DB_FILE, 'utf8');
     const parsed = JSON.parse(raw);
     const settings = { ...DEFAULT_SETTINGS, ...(parsed.settings ?? {}) };
+    // Version 1 of multi-agent support forced Terra as Codex's default. Model
+    // access varies by account/client, so migrate that generated value back
+    // to "use Codex's configured/recommended default". Explicit selections
+    // made after this migration are retained because the DB is now version 2.
+    if ((parsed.version ?? 1) < 2 && settings.agent === 'codex' && settings.model === 'gpt-5.6-terra') {
+      settings.model = '';
+    }
     settings.workingDir = resolveDir(settings.workingDir);
     const cards = parsed.cards ?? {};
     // Migrate cards written before per-project boards existed: pin them to
@@ -59,9 +101,51 @@ function load() {
     // don't drift the next time the board default is switched.
     for (const card of Object.values(cards)) {
       if (!card.projectDir) card.projectDir = resolveDir(card.workingDir || settings.workingDir);
+      const legacyCodexModelMismatch =
+        (parsed.version ?? 1) < 2 &&
+        settings.agent === 'codex' &&
+        /selected model \(gpt-|Claude Code returned.*selected model \(gpt-/i.test(card.error ?? '');
+
+      if (legacyCodexModelMismatch) {
+        // The new settings UI was briefly able to talk to an old Claude-only
+        // server. That server created a Claude session while passing it a GPT
+        // model. The session cannot be resumed by Codex, so retry it cleanly.
+        card.sessionId = null;
+        card.sessionAgent = null;
+        card.sessionModel = null;
+        card.model = null;
+      } else {
+        // Sessions created before multi-agent support are Claude sessions. Pin
+        // their backend and model so a later board-level agent switch cannot
+        // try to resume the session with an incompatible runner.
+        if (card.sessionId && !card.sessionAgent) card.sessionAgent = 'claude';
+        if (card.sessionId && !card.sessionModel) {
+          card.sessionModel = card.model || 'claude-sonnet-5';
+        }
+      }
+      if ((parsed.version ?? 1) < 2 && card.sessionAgent === 'codex') {
+        if (card.sessionModel === 'gpt-5.6-terra') card.sessionModel = null;
+        if (card.model === 'gpt-5.6-terra') card.model = null;
+      }
+      if (!('changesRevertedAt' in card)) {
+        card.changesRevertedAt = revertedAtFromLog(card.id);
+      }
+    }
+    // Older data may have the project control below ordinary tasks. Repair
+    // every affected column on load so display order and queue order agree.
+    const groups = new Map();
+    for (const card of Object.values(cards)) {
+      const key = `${card.projectDir}\0${card.column}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(card);
+    }
+    for (const group of groups.values()) {
+      sortRunProjectCardFirst(group).forEach((card, index) => {
+        card.order = index;
+      });
     }
     return {
-      version: 1,
+      version: 3,
       cards,
       settings,
     };
@@ -100,7 +184,9 @@ export function getSettings() {
 }
 
 export function updateSettings(patch) {
-  const clean = 'workingDir' in patch ? { ...patch, workingDir: resolveDir(patch.workingDir) } : patch;
+  const clean = 'workingDir' in patch ? { ...patch, workingDir: resolveDir(patch.workingDir) } : { ...patch };
+  if ('agent' in clean && !['claude', 'codex'].includes(clean.agent)) delete clean.agent;
+  if (clean.agent === 'codex' && !('model' in clean)) clean.model = '';
   db.settings = { ...db.settings, ...clean };
   persist();
   return getSettings();
@@ -157,13 +243,14 @@ function fallbackTitle(prompt) {
 
 export function createCard(input = {}) {
   const now = new Date().toISOString();
-  const column = COLUMN_IDS.includes(input.column) ? input.column : 'backlog';
+  const column = USER_COLUMN_IDS.includes(input.column) ? input.column : 'backlog';
   // The project this card belongs to, fixed at creation (or whenever the
   // working-dir override changes) so it doesn't drift if the board default
   // is later switched to a different project.
   const projectDir = resolveDir(input.workingDir || db.settings.workingDir);
   const card = {
     id: randomUUID(),
+    kind: input.kind ?? 'task',
     title: (input.title ?? '').trim() || fallbackTitle(input.prompt),
     prompt: input.prompt ?? '',
     column,
@@ -180,8 +267,13 @@ export function createCard(input = {}) {
     startedAt: null,
     finishedAt: null,
     // runtime
-    runState: 'idle', // idle | queued | running | waiting | finished | error | stopped
+    runState: 'idle', // idle | queued | running | waiting | reverting | finished | error | stopped
     sessionId: null,
+    // The backend/model are pinned when the first turn starts. `agent` is an
+    // optional future per-card override; null means use the board setting.
+    agent: input.agent ?? null,
+    sessionAgent: null,
+    sessionModel: null,
     lastResult: null,
     error: null,
     pendingPermission: null,
@@ -189,6 +281,13 @@ export function createCard(input = {}) {
     gitBefore: null,
     gitAfter: null,
     diffStat: null,
+    // Private Git tree refs bounding everything this agent session changed.
+    // They let moving the card to Cancelled undo this session without
+    // resetting changes made by other cards.
+    changeSnapshot: null,
+    // Kept after the private snapshot refs are released so cancelling an
+    // already-undone session remains an idempotent card move.
+    changesRevertedAt: null,
     runCount: 0,
     unread: false,
   };
@@ -236,8 +335,10 @@ export function moveCard(id, column, index) {
 
   // Scoped to this card's project: reordering only ever touches cards that
   // actually share its board, so it can't shuffle another project's queue.
-  const siblings = listCards({ project }).filter((c) => c.column === column && c.id !== id);
-  const at = Math.max(0, Math.min(index ?? siblings.length, siblings.length));
+  const siblings = sortRunProjectCardFirst(
+    listCards({ project }).filter((c) => c.column === column && c.id !== id),
+  );
+  const at = runProjectPinnedIndex(card, siblings, index);
   siblings.splice(at, 0, card);
   siblings.forEach((c, i) => {
     c.order = i;

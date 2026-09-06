@@ -1,9 +1,9 @@
 # Kanban Agents
 
-A Trello-style board that schedules Claude Code sessions. Drag a card into
-**In Progress** and it runs. Cards run **strictly one at a time, in one working
-directory**, so each task builds on the previous one's changes instead of
-fighting it on a separate branch.
+A Trello-style board that schedules Claude Code or Codex sessions. Drag a card into
+**In Progress** and it runs. Cards run **strictly one at a time per project**,
+so tasks sharing a working directory build on previous changes instead of
+fighting, while independent projects can run concurrently.
 
 ## Run it
 
@@ -31,11 +31,20 @@ the process is still alive, and confirms it's actually answering on `/api/health
 
 ### Authentication
 
-Sessions are spawned through the Claude Agent SDK, which uses the same
-credentials as the `claude` CLI. If a card fails with
-`401 OAuth access token has expired`, run `claude` in a terminal and log in
-(or set `ANTHROPIC_API_KEY` before starting the server), then reply on the card
-to retry it.
+Both agents use their CLI's saved subscription login; the board does not ask
+for or store API keys.
+
+- **Claude Code:** run `claude` in a terminal and sign in.
+- **Codex:** after `npm run setup`, run `npm run login:codex` and choose
+  **Sign in with ChatGPT**. The bundled Codex CLI and the board reuse that
+  cached login.
+
+Choose the agent in **Settings**. Existing sessions stay pinned to the agent
+and model that created them, so they remain resumable after the board default
+changes. Resetting a card starts a fresh session with the current defaults.
+For Codex, leave the model on **Codex configured default** unless you know a
+specific model is available to your signed-in account; Codex will otherwise
+choose its configured or recommended available model.
 
 ## The columns
 
@@ -46,17 +55,18 @@ to retry it.
 | **Needs Input** | The session is blocked on you — a permission prompt, a question, an error, or a stop. |
 | **Review** | Finished successfully; you haven't checked it yet. |
 | **Done** | Checked and accepted. |
-| **Cancelled** | Not doing it. Dragging a running card here stops its session. |
+| **Cancelled** | Not doing it. Moving a card here stops it and reverts the filesystem changes made by its session. |
 
 ## How the queue works
 
-Exactly one session may run at a time. When it ends, the next card in
-**In Progress** starts — so the order you drag cards into that column is the
-order they execute in, and each one sees the working tree the previous one left.
+Exactly one session may run at a time in each project. Different projects can
+run concurrently. Within a project, when a session ends, the next card in
+**In Progress** starts — so their order is their execution order, and each one
+sees the working tree the previous card left.
 
-The queue holds while any card sits in **Needs Input** (a setting you can turn
-off). That is deliberate: starting the next task on a tree that a blocked task
-left half-finished is how you get conflicts.
+Each project's queue holds while one of its cards sits in **Needs Input** (a
+setting you can turn off). That is deliberate: starting the next task on a tree
+that a blocked task left half-finished is how you get conflicts.
 
 - **Pause queue** stops new cards from starting; the running one finishes.
 - **Stop current** interrupts the running session and parks it in Needs Input.
@@ -76,15 +86,22 @@ Click a card to open it.
 
 ### Needs Input
 
-When Claude asks for a permission it doesn't have, the card moves itself to
+When Claude Code asks for a permission it doesn't have, the card moves itself to
 Needs Input and the session **stays open**, waiting. Approve or deny it from the
 card and the session picks up where it left off and the card slides back to
 In Progress. `AskUserQuestion` works the same way, with the options rendered as
 buttons.
 
-The default permission mode is `acceptEdits` — file edits go through, commands
-ask. Set a card (or the board) to `bypassPermissions` for fully unattended runs,
-or `plan` to have Claude write a plan without touching anything.
+The default permission mode is `acceptEdits` — file edits go through and Claude
+commands ask. Set a card (or the board) to `bypassPermissions` for fully
+unattended runs, or `plan` to have the agent write a plan without touching
+anything.
+
+Codex runs non-interactively: normal permission modes map to its safe
+`workspace-write` sandbox, `plan` maps to `read-only`, and
+`bypassPermissions` maps to unrestricted filesystem access. A Codex action
+outside its sandbox is denied; reply on the card with guidance (or change the
+mode and reset it) to continue.
 
 ### Dictation
 
@@ -110,13 +127,13 @@ directory at the time, or its own working-directory override - and only that
 project's cards are shown.
 
 Switch projects from the dropdown in the bar under the header, or by changing
-the working directory in Settings. The columns, the queue, and the running
-card all follow: cards from other projects sit untouched until you switch back
-to them, so two projects never race for the same working tree.
+the working directory in Settings. The columns and visible running card follow.
+Each project owns its own execution slot, so work in another project can continue
+without blocking the board you are viewing.
 
 ## Settings
 
-Board defaults for working directory, model, permission mode, and effort; where
+Board defaults for agent, working directory, model, permission mode, and effort; where
 a finished card lands (Review or Done); a max-turns cap; whether the queue holds
 on Needs Input; and an extra system prompt appended to every session — useful
 for standing rules like "always run the test suite before you finish".
@@ -131,8 +148,9 @@ Everything lives in `~/.kanban-agents`:
   startup, removed on clean shutdown, read by `npm run status`
 
 Set `KANBAN_DATA_DIR` to move it, `PORT` to change the port. Session transcripts
-are also written to `~/.claude/projects` by the CLI itself, so a card's session
-can be resumed from the `claude` CLI too.
+are also written by the selected agent: Claude under `~/.claude/projects` and
+Codex under `~/.codex/sessions`. A card's session can therefore be resumed from
+the matching CLI too.
 
 If the server dies mid-session, the card is requeued on the next start.
 
@@ -141,7 +159,7 @@ If the server dies mid-session, the card is requeued on the next start.
 ```
 server/src/
   index.js    HTTP + SSE API
-  runner.js   the single-slot queue and Agent SDK session driver
+  runner.js   per-project queues and Claude/Codex session drivers
   store.js    JSON board + JSONL transcripts
   git.js      before/after snapshots and diffstat
   status.js   `npm run status` — is the server running, and where

@@ -19,6 +19,8 @@
   --accent-soft: #f2e5df;
   --run: #8a6a1c;
   --run-soft: #f4ecd8;
+  --project-run: #3979b8;
+  --project-run-soft: #e7f1fb;
   --ok: #4a6b41;
   --ok-soft: #e6ecdf;
   --bad: #97372f;
@@ -48,6 +50,8 @@
   --accent-soft: #33231b;
   --run: #c8a049;
   --run-soft: #2c2617;
+  --project-run: #72aee6;
+  --project-run-soft: #172b3d;
   --ok: #8bb07a;
   --ok-soft: #1e2618;
   --bad: #d98078;
@@ -116,26 +120,6 @@ h1, h2, h3, h4 { margin: 0; font-weight: 600; }
 }
 .queue-status b { font-weight: 600; color: var(--ink); }
 .queue-status.is-paused { color: var(--run); }
-
-/* server reachability + address, straight from the SSE connection */
-.conn-status {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-family: var(--mono);
-  font-size: 11.5px;
-  color: var(--ink-3);
-  flex-shrink: 0;
-}
-.conn-dot {
-  width: 6px; height: 6px; border-radius: 50%;
-  background: var(--ok); flex-shrink: 0;
-}
-.conn-status.is-reconnecting { color: var(--bad); }
-.conn-status.is-reconnecting .conn-dot {
-  background: var(--bad);
-  animation: breathe 1s ease-in-out infinite;
-}
 
 /* a slow breathing dot reads as "alive" without a spinning ring */
 .live-dot {
@@ -326,6 +310,22 @@ h1, h2, h3, h4 { margin: 0; font-weight: 600; }
 .card:active { transform: scale(0.995); }
 .card.is-dragging { opacity: 0.35; }
 
+.card.card-run-project {
+  background: var(--project-run-soft);
+  border-color: color-mix(in srgb, var(--project-run) 45%, var(--rule));
+}
+.card.card-run-project .card-title { color: var(--project-run); font-weight: 650; }
+.card.card-run-project::after {
+  content: '\25b6';
+  color: var(--project-run);
+  font-size: 9px;
+  margin-left: 8px;
+  position: absolute;
+  right: 11px;
+  top: 13px;
+}
+.card.card-run-project .card-head { padding-right: 15px; }
+
 /* the running card is marked by a rule, not a glow */
 .card.is-running { border-color: var(--rule-2); }
 .card.is-running::before {
@@ -364,6 +364,7 @@ h1, h2, h3, h4 { margin: 0; font-weight: 600; }
 /* status reads as a typographic mark, not a coloured capsule */
 .state { color: var(--ink-4); display: inline-flex; align-items: center; gap: 5px; }
 .state-running { color: var(--run); }
+.state-reverting { color: var(--run); }
 .state-waiting { color: var(--accent); }
 .state-error { color: var(--bad); }
 .state-finished { color: var(--ok); }
@@ -371,7 +372,7 @@ h1, h2, h3, h4 { margin: 0; font-weight: 600; }
   content: ''; width: 4px; height: 4px; border-radius: 50%;
   background: currentColor; opacity: 0.7;
 }
-.state-running::before { animation: breathe 1.8s ease-in-out infinite; opacity: 1; }
+.state-running::before, .state-reverting::before { animation: breathe 1.8s ease-in-out infinite; opacity: 1; }
 .state-queued::before, .state-idle::before { display: none; }
 
 .tag {
@@ -429,6 +430,8 @@ h1, h2, h3, h4 { margin: 0; font-weight: 600; }
 }
 .drawer-title:hover { border-color: var(--rule); }
 .drawer-title:focus { border-color: var(--rule-2); background: var(--paper); }
+.drawer-title[readonly] { cursor: default; }
+.drawer-title[readonly]:hover { border-color: transparent; }
 .drawer-head-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
 
 .tabs {
@@ -444,6 +447,12 @@ h1, h2, h3, h4 { margin: 0; font-weight: 600; }
 .tab:hover { color: var(--ink-2); }
 .tab.is-active { color: var(--ink); border-bottom-color: var(--accent); }
 .tabs-spacer { flex: 1; }
+.tabs-model {
+  max-width: 210px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--ink-3); font-size: 11px;
+}
+.tabs-model b { color: var(--ink-2); font-family: var(--mono); font-weight: 500; }
+.tabs-model + .tabs-stats::before { content: '\00b7'; margin: 0 8px; }
 .tabs-stats {
   color: var(--ink-4); font-family: var(--mono); font-size: 10.5px;
   font-variant-numeric: tabular-nums;

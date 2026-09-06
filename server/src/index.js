@@ -12,6 +12,13 @@ import * as git from './git.js';
 import { checkAuth } from './auth.js';
 import { generateTitle } from './titler.js';
 import * as projectRun from './projectRun.js';
+import {
+  RUN_PROJECT_KIND,
+  RUN_PROJECT_LABEL,
+  canMoveRunProjectCard,
+  createRunProjectPrompt,
+  isRunProjectCard,
+} from './runProjectCard.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT ?? 4317);
@@ -31,8 +38,8 @@ async function boardPayload() {
     cards: store.listCards({ project: settings.workingDir }),
     projects: store.listProjects(),
     settings,
-    runningCardId: runner.current?.cardId ?? null,
-    auth: checkAuth(),
+    runningCardId: runner.runningCardId(settings.workingDir),
+    auth: checkAuth(settings.agent),
     projectRun: await projectRun.getRunStatus(settings.workingDir),
   };
 }
@@ -62,6 +69,12 @@ api.patch('/settings', (req, res) => {
 
 api.post('/cards', (req, res) => {
   const body = req.body ?? {};
+  if (body.kind === RUN_PROJECT_KIND) {
+    return res.status(400).json({ error: 'Run project cards are created by the project runner.' });
+  }
+  if (body.column === 'needs_input') {
+    return res.status(400).json({ error: 'Needs Input is reserved for agent requests' });
+  }
   const card = store.createCard(body);
   runner.broadcast();
   runner.tick();
@@ -71,7 +84,12 @@ api.post('/cards', (req, res) => {
   // in the background and push the update once it lands.
   const hadExplicitTitle = Boolean((body.title ?? '').trim());
   if (!hadExplicitTitle && card.prompt?.trim()) {
-    generateTitle(card.prompt)
+    const settings = store.getSettings();
+    generateTitle(card.prompt, {
+      agent: settings.agent,
+      model: settings.model,
+      cwd: card.projectDir,
+    })
       .then((title) => {
         if (!title || !store.getCard(card.id)) return;
         store.updateCard(card.id, { title });
@@ -82,14 +100,42 @@ api.post('/cards', (req, res) => {
 });
 
 api.patch('/cards/:id', (req, res) => {
-  const card = store.updateCard(req.params.id, req.body ?? {});
-  if (!card) return res.status(404).json({ error: 'not found' });
+  if (req.body?.column === 'needs_input') {
+    return res.status(400).json({ error: 'Needs Input is reserved for agent requests' });
+  }
+  const before = store.getCard(req.params.id);
+  if (!before) return res.status(404).json({ error: 'not found' });
+  if (before.runState === 'reverting') {
+    return res.status(409).json({ error: 'Wait for this card\'s changes to finish reverting' });
+  }
+  const patch = { ...(req.body ?? {}) };
+  // Card identity is assigned by the server and cannot be promoted through
+  // the generic task endpoint (which would bypass singleton enforcement).
+  delete patch.kind;
+  if (isRunProjectCard(before)) {
+    if (patch.column && !canMoveRunProjectCard(patch.column)) {
+      return res.status(400).json({
+        error: 'Run project can only be placed in In Progress or Done.',
+      });
+    }
+    // This is a board control, not an editable task. Its prompt is internal.
+    delete patch.title;
+    delete patch.prompt;
+    delete patch.labels;
+    delete patch.workingDir;
+    delete patch.column;
+  }
+  const card = store.updateCard(req.params.id, patch);
   runner.broadcast();
   res.json(card);
 });
 
 api.delete('/cards/:id', async (req, res) => {
+  if (store.getCard(req.params.id)?.runState === 'reverting') {
+    return res.status(409).json({ error: 'Wait for this card\'s changes to finish reverting' });
+  }
   await runner.cancelIfRunning(req.params.id);
+  await git.releaseSessionSnapshot(store.getCard(req.params.id)?.changeSnapshot);
   const ok = store.deleteCard(req.params.id);
   runner.broadcast();
   runner.tick();
@@ -100,13 +146,116 @@ api.post('/cards/:id/move', async (req, res) => {
   const { column, index } = req.body ?? {};
   const before = store.getCard(req.params.id);
   if (!before) return res.status(404).json({ error: 'not found' });
+  if (isRunProjectCard(before) && runner.currentForProject(before.projectDir)) {
+    return res.status(409).json({ error: 'Stop the running task before moving Run project' });
+  }
+  if (before.runState === 'running' || runner.currentForCard(before.id)) {
+    return res.status(409).json({ error: 'Stop the running card before moving it' });
+  }
+  if (before.runState === 'reverting') {
+    return res.status(409).json({ error: 'Wait for this card\'s changes to finish reverting' });
+  }
+  if (column === 'needs_input') {
+    return res.status(400).json({ error: 'Needs Input is reserved for agent requests' });
+  }
+  if (!store.COLUMN_IDS.includes(column)) {
+    return res.status(400).json({ error: 'bad column' });
+  }
+  if (isRunProjectCard(before) && !canMoveRunProjectCard(column)) {
+    return res.status(400).json({
+      error: 'Run project can only be placed in In Progress or Done.',
+    });
+  }
 
-  // Dragging a live session out of In Progress stops it.
-  if (before.column === 'in_progress' && column !== 'in_progress') {
+  // A waiting card may still own the live session. Moving it out of the queue
+  // must finish aborting before its filesystem snapshot can be safely reverted.
+  if (column !== 'in_progress') {
     await runner.cancelIfRunning(req.params.id);
   }
 
-  const card = store.moveCard(req.params.id, column, index);
+  // Re-entering the queue means rerun the project from the beginning, never
+  // resume the old agent conversation. Reordering within the queue is not a rerun.
+  if (isRunProjectCard(before) && column === 'in_progress' && before.column !== column) {
+    await git.releaseSessionSnapshot(before.changeSnapshot);
+    store.clearEvents(before.id);
+    store.updateCard(before.id, {
+      prompt: runProjectPrompt(before.projectDir),
+      sessionId: null,
+      sessionAgent: null,
+      sessionModel: null,
+      runState: 'idle',
+      error: null,
+      stats: null,
+      lastResult: null,
+      diffStat: null,
+      changeSnapshot: null,
+      changesRevertedAt: null,
+      gitBefore: null,
+      gitAfter: null,
+      startedAt: null,
+      finishedAt: null,
+      pendingPermission: null,
+      pendingReply: null,
+      unread: false,
+    });
+  }
+
+  let card = null;
+  if (column === 'cancelled' && before.column !== 'cancelled') {
+    const current = store.getCard(req.params.id);
+    if (current.changeSnapshot) {
+      const previous = {
+        column: current.column,
+        order: current.order,
+        runState: current.runState,
+        error: current.error,
+      };
+      const restorePreviousState = () => {
+        store.moveCard(current.id, previous.column, previous.order);
+        store.updateCard(current.id, { runState: previous.runState, error: previous.error });
+        runner.broadcast();
+      };
+      card = store.moveCard(current.id, column, index);
+      store.updateCard(current.id, { runState: 'reverting', error: null });
+      runner.broadcast();
+
+      let reverted;
+      try {
+        reverted = await git.revertSessionChanges(current.changeSnapshot);
+      } catch (err) {
+        restorePreviousState();
+        return res.status(500).json({
+          error: `Could not revert this session's changes: ${err?.message || String(err)}`,
+        });
+      }
+      if (!reverted.ok) {
+        restorePreviousState();
+        return res.status(409).json({ error: reverted.error });
+      }
+      store.updateCard(current.id, {
+        runState: 'stopped',
+        changeSnapshot: null,
+        changesRevertedAt: new Date().toISOString(),
+        gitAfter: await git.snapshot(current.projectDir),
+        diffStat: null,
+      });
+      runner.record(current.id, {
+        type: 'status',
+        level: 'warn',
+        text: reverted.changed
+          ? 'Moved to Cancelled — all changes from this session were reverted.'
+          : 'Moved to Cancelled — this session made no filesystem changes.',
+      });
+    } else if ((current.runCount ?? 0) > 0 && !current.changesRevertedAt) {
+      runner.broadcast();
+      return res.status(409).json({
+        error:
+          'This older session has no rollback snapshot, so it cannot be cancelled without risking unrelated work.',
+      });
+    }
+  }
+
+  card ??= store.moveCard(req.params.id, column, index);
   if (!card) return res.status(400).json({ error: 'bad column' });
 
   if (column === 'in_progress' && card.runState !== 'running') {
@@ -129,6 +278,9 @@ api.get('/cards/:id/events', (req, res) => {
 });
 
 api.post('/cards/:id/reply', (req, res) => {
+  if (store.getCard(req.params.id)?.runState === 'reverting') {
+    return res.status(409).json({ error: 'Wait for this card\'s changes to finish reverting' });
+  }
   const ok = runner.reply(req.params.id, req.body?.text ?? '');
   res.json({ ok });
 });
@@ -147,15 +299,25 @@ api.post('/cards/:id/stop', async (req, res) => {
 
 /** Wipe the transcript and forget the session so the next run starts clean. */
 api.post('/cards/:id/reset', async (req, res) => {
+  if (store.getCard(req.params.id)?.runState === 'reverting') {
+    return res.status(409).json({ error: 'Wait for this card\'s changes to finish reverting' });
+  }
   await runner.cancelIfRunning(req.params.id);
+  await git.releaseSessionSnapshot(store.getCard(req.params.id)?.changeSnapshot);
   store.clearEvents(req.params.id);
   const card = store.updateCard(req.params.id, {
     sessionId: null,
+    sessionAgent: null,
+    sessionModel: null,
+    agent: null,
+    model: null,
     runState: 'idle',
     error: null,
     stats: null,
     lastResult: null,
     diffStat: null,
+    changeSnapshot: null,
+    changesRevertedAt: null,
     startedAt: null,
     finishedAt: null,
     pendingPermission: null,
@@ -206,56 +368,64 @@ api.get('/git/status', async (req, res) => {
 
 /* ------------------------------ run project ------------------------------ */
 
-const RUN_PROJECT_LABEL = 'run-project';
-
 function runProjectPrompt(dir) {
-  const statusPath = projectRun.statusFilePath(dir);
-  return `Get this project running locally so it can be opened in a browser.
-
-Working directory: ${dir}
-
-1. Work out how this project is built and run - check package.json scripts, or
-   whatever the equivalent is for this stack (Python, Go, Rust, a Makefile,
-   etc). Install dependencies first if that hasn't been done yet.
-2. Start its dev/preview server *in the background*, fully detached from this
-   session, so it keeps running after you finish responding (e.g. on Windows,
-   \`start /B\` or spawn detached with output redirected to a log file; on
-   POSIX, \`nohup ... > log 2>&1 & disown\`). Do not run it in the foreground -
-   that would block this task forever.
-3. Confirm it actually answers before reporting success (curl/fetch it).
-4. Write exactly this JSON to exactly this file path (create parent
-   directories if needed), with the real port and command substituted in:
-
-   ${statusPath}
-
-   {"url": "http://localhost:<port>", "command": "<command you used to start it>", "startedAt": "<current ISO timestamp>"}
-
-If there's no sensible way to "run" this project (e.g. it's a library, not an
-app), don't guess - say so in your final message instead of writing that file.`;
+  return createRunProjectPrompt(dir, projectRun.statusFilePath(dir));
 }
 
 /** Kicks off a card that builds/starts whatever project lives in `dir` and reports its URL back. */
-api.post('/projects/run', (req, res) => {
+api.post('/projects/run', async (req, res) => {
   const settings = store.getSettings();
   const dir = store.resolveDir(req.body?.dir || settings.workingDir);
 
-  // Don't pile up duplicate run cards if one's already in flight for this project.
+  // This is a singleton project control, including after it has completed.
   const already = store
     .listCards({ project: dir })
-    .find(
-      (c) =>
-        c.labels?.includes(RUN_PROJECT_LABEL) &&
-        ['backlog', 'in_progress', 'needs_input'].includes(c.column),
-    );
-  if (already) return res.status(200).json(already);
+    .find(isRunProjectCard);
+  if (already) {
+    // Repeated clicks while this control is already queued/running are
+    // idempotent. A completed control, however, starts a fresh agent session
+    // so it can restart a live server or bring a stopped one back up.
+    if (runner.currentForCard(already.id) || already.column === 'in_progress') {
+      return res.status(200).json(already);
+    }
+
+    await git.releaseSessionSnapshot(already.changeSnapshot);
+    store.clearEvents(already.id);
+    store.updateCard(already.id, {
+      prompt: runProjectPrompt(dir),
+      sessionId: null,
+      sessionAgent: null,
+      sessionModel: null,
+      runState: 'idle',
+      error: null,
+      stats: null,
+      lastResult: null,
+      diffStat: null,
+      changeSnapshot: null,
+      changesRevertedAt: null,
+      gitBefore: null,
+      gitAfter: null,
+      startedAt: null,
+      finishedAt: null,
+      pendingPermission: null,
+      pendingReply: null,
+      unread: false,
+    });
+    const card = store.moveCard(already.id, 'in_progress', 0);
+    runner.broadcast();
+    runner.tick();
+    return res.status(200).json(card);
+  }
 
   const card = store.createCard({
+    kind: RUN_PROJECT_KIND,
     title: 'Run project',
     prompt: runProjectPrompt(dir),
     column: 'in_progress',
     labels: [RUN_PROJECT_LABEL],
     workingDir: dir,
   });
+  store.moveCard(card.id, card.column, 0);
   runner.broadcast();
   runner.tick();
   res.status(201).json(card);
@@ -313,7 +483,7 @@ if (fs.existsSync(webDist)) {
 
 /* --------------------------------- boot ---------------------------------- */
 
-runner.recover();
+await runner.recover();
 runner.tick();
 
 // Dropped next to the board data so `npm run status` (server/src/status.js)

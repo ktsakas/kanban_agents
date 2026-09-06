@@ -2,13 +2,14 @@
   "name": "kanban-agents",
   "version": "1.0.0",
   "private": true,
-  "description": "A Trello-style board that schedules Claude Code sessions, one at a time, in one working directory.",
+  "description": "A Trello-style board that schedules Claude Code or Codex sessions sequentially per project.",
   "scripts": {
     "setup": "npm --prefix server install && npm --prefix web install",
     "build": "npm --prefix web run build",
     "start": "npm run build && npm --prefix server start",
     "server": "npm --prefix server start",
     "web": "npm --prefix web run dev",
-    "status": "npm --prefix server run status"
+    "status": "npm --prefix server run status",
+    "login:codex": "node server/node_modules/@openai/codex/bin/codex.js login"
   }
 }

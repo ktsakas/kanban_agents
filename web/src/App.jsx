@@ -9,10 +9,19 @@ const RUN_STATE_LABEL = {
   queued: 'Queued',
   running: 'Running',
   waiting: 'Waiting on you',
+  reverting: 'Reverting',
   finished: 'Finished',
   error: 'Error',
   stopped: 'Stopped',
 };
+
+const NEEDS_INPUT_COLUMN = 'needs_input';
+const RUN_PROJECT_COLUMNS = ['in_progress', 'done'];
+
+function isRunProjectCard(card) {
+  return card.kind === 'run_project' ||
+    (card.kind == null && card.title === 'Run project' && card.labels?.includes('run-project'));
+}
 
 function relativeTime(iso) {
   if (!iso) return '';
@@ -32,16 +41,24 @@ function formatCost(usd) {
 
 /* --------------------------------- card ---------------------------------- */
 
-function Card({ card, isRunning, queuePosition, onOpen, onDragStart, onDragEnd, dragging }) {
+function Card({ card, isRunning, hasRunningTask, queuePosition, onOpen, onDragStart, onDragEnd, dragging }) {
   const stats = card.stats;
+  const isProjectRunner = isRunProjectCard(card);
+  const isReverting = card.runState === 'reverting';
+  const moveLocked = isProjectRunner && hasRunningTask;
   return (
     <article
-      className={`card ${dragging ? 'is-dragging' : ''} ${isRunning ? 'is-running' : ''}`}
-      draggable
+      className={`card ${isProjectRunner ? 'card-run-project' : ''} ${dragging ? 'is-dragging' : ''} ${isRunning ? 'is-running' : ''}`}
+      draggable={!isRunning && !isReverting && !moveLocked}
+      title={moveLocked ? 'Stop the running task before moving Run project' : undefined}
       onDragStart={(e) => {
+        if (isRunning || isReverting || moveLocked) {
+          e.preventDefault();
+          return;
+        }
         e.dataTransfer.effectAllowed = 'move';
         e.dataTransfer.setData('text/plain', card.id);
-        onDragStart(card.id);
+        onDragStart(card);
       }}
       onDragEnd={onDragEnd}
       onClick={() => onOpen(card.id)}
@@ -51,7 +68,7 @@ function Card({ card, isRunning, queuePosition, onOpen, onDragStart, onDragEnd, 
         {card.unread && <span className="dot-unread" title="New activity" />}
       </header>
 
-      {card.prompt && <p className="card-prompt">{card.prompt}</p>}
+      {!isProjectRunner && card.prompt && <p className="card-prompt">{card.prompt}</p>}
 
       <div className="card-meta">
         {isRunning ? (
@@ -64,14 +81,14 @@ function Card({ card, isRunning, queuePosition, onOpen, onDragStart, onDragEnd, 
           <span className={`state state-${card.runState}`}>{RUN_STATE_LABEL[card.runState]}</span>
         ) : null}
         {card.model && <span className="tag tag-model">{card.model.replace('claude-', '')}</span>}
-        {card.labels?.map((label) => (
+        {!isProjectRunner && card.labels?.map((label) => (
           <span key={label} className="tag">
             {label}
           </span>
         ))}
       </div>
 
-      {(stats || card.finishedAt) && (
+      {!isProjectRunner && (stats || card.finishedAt) && (
         <footer className="card-foot">
           {stats?.numTurns != null && (
             <span>
@@ -92,16 +109,27 @@ function Column({ column, cards, runningCardId, onOpen, onDrop, drag, setDrag, o
   const [adding, setAdding] = useState(false);
   const [draft, setDraft] = useState('');
   const listRef = useRef(null);
+  const acceptsUserCards = column.id !== NEEDS_INPUT_COLUMN;
+  const acceptsDraggedCard =
+    acceptsUserCards &&
+    drag.cardId !== runningCardId &&
+    !(drag.isRunProject && runningCardId) &&
+    (!drag.isRunProject || RUN_PROJECT_COLUMNS.includes(column.id));
 
   const dropIndex = drag.overColumn === column.id ? drag.overIndex : null;
 
   function computeIndex(event) {
     const nodes = [...(listRef.current?.querySelectorAll('[data-card]') ?? [])];
+    let index = nodes.length;
     for (let i = 0; i < nodes.length; i += 1) {
       const rect = nodes[i].getBoundingClientRect();
-      if (event.clientY < rect.top + rect.height / 2) return i;
+      if (event.clientY < rect.top + rect.height / 2) {
+        index = i;
+        break;
+      }
     }
-    return nodes.length;
+    if (drag.isRunProject) return 0;
+    return cards.some(isRunProjectCard) ? Math.max(1, index) : index;
   }
 
   return (
@@ -109,6 +137,10 @@ function Column({ column, cards, runningCardId, onOpen, onDrop, drag, setDrag, o
       className="column"
       data-col={column.id}
       onDragOver={(e) => {
+        if (!acceptsDraggedCard) {
+          e.dataTransfer.dropEffect = 'none';
+          return;
+        }
         e.preventDefault();
         e.dataTransfer.dropEffect = 'move';
         const index = computeIndex(e);
@@ -117,6 +149,7 @@ function Column({ column, cards, runningCardId, onOpen, onDrop, drag, setDrag, o
         }
       }}
       onDrop={(e) => {
+        if (!acceptsDraggedCard) return;
         e.preventDefault();
         const id = e.dataTransfer.getData('text/plain') || drag.cardId;
         if (id) onDrop(id, column.id, computeIndex(e));
@@ -125,9 +158,11 @@ function Column({ column, cards, runningCardId, onOpen, onDrop, drag, setDrag, o
       <header className="column-head">
         <h2>{column.title}</h2>
         <span className="column-count">{cards.length}</span>
-        <button className="icon-btn" title="Add a task" onClick={() => setAdding((v) => !v)}>
-          +
-        </button>
+        {acceptsUserCards && (
+          <button className="icon-btn" title="Add a task" onClick={() => setAdding((v) => !v)}>
+            +
+          </button>
+        )}
       </header>
 
       {adding && (
@@ -143,7 +178,7 @@ function Column({ column, cards, runningCardId, onOpen, onDrop, drag, setDrag, o
           <div className="textarea-wrap">
             <textarea
               autoFocus
-              placeholder="What should Claude do?"
+              placeholder="What should the agent do?"
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
               onKeyDown={(e) => {
@@ -172,13 +207,19 @@ function Column({ column, cards, runningCardId, onOpen, onDrop, drag, setDrag, o
               <Card
                 card={card}
                 isRunning={card.id === runningCardId}
+                hasRunningTask={Boolean(runningCardId)}
                 queuePosition={
                   column.id === 'in_progress' && card.id !== runningCardId ? index : null
                 }
                 dragging={drag.cardId === card.id}
                 onOpen={onOpen}
-                onDragStart={(id) => setDrag({ cardId: id, overColumn: null, overIndex: null })}
-                onDragEnd={() => setDrag({ cardId: null, overColumn: null, overIndex: null })}
+                onDragStart={(draggedCard) => setDrag({
+                  cardId: draggedCard.id,
+                  isRunProject: isRunProjectCard(draggedCard),
+                  overColumn: null,
+                  overIndex: null,
+                })}
+                onDragEnd={() => setDrag({ cardId: null, isRunProject: false, overColumn: null, overIndex: null })}
               />
             </div>
           </React.Fragment>
@@ -197,14 +238,10 @@ export default function App() {
   const [openCardId, setOpenCardId] = useState(null);
   const [showSettings, setShowSettings] = useState(false);
   const [search, setSearch] = useState('');
-  const [drag, setDrag] = useState({ cardId: null, overColumn: null, overIndex: null });
+  const [drag, setDrag] = useState({ cardId: null, isRunProject: false, overColumn: null, overIndex: null });
   const [theme, setTheme] = useState(() => localStorage.getItem('theme') ?? 'light');
-  const [connected, setConnected] = useState(true);
 
-  useEffect(
-    () => subscribe('/stream/board', setBoard, (status) => setConnected(status === 'open')),
-    [],
-  );
+  useEffect(() => subscribe('/stream/board', setBoard), []);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -225,22 +262,37 @@ export default function App() {
   const byColumn = useMemo(() => {
     const map = Object.fromEntries((board?.columns ?? []).map((c) => [c.id, []]));
     for (const card of filtered) map[card.column]?.push(card);
-    for (const list of Object.values(map)) list.sort((a, b) => a.order - b.order);
+    for (const list of Object.values(map)) {
+      list.sort((a, b) => {
+        const pinned = Number(isRunProjectCard(b)) - Number(isRunProjectCard(a));
+        return pinned || a.order - b.order;
+      });
+    }
     return map;
   }, [board, filtered]);
 
   const handleDrop = useCallback(
     async (id, column, index) => {
-      setDrag({ cardId: null, overColumn: null, overIndex: null });
+      setDrag({ cardId: null, isRunProject: false, overColumn: null, overIndex: null });
+      const card = board?.cards.find((candidate) => candidate.id === id);
+      if (board?.runningCardId === id || card?.runState === 'running') return;
+      if (isRunProjectCard(card) && board?.runningCardId) return;
+
       // Optimistic: the SSE board push will reconcile.
       setBoard((prev) =>
         prev
           ? { ...prev, cards: prev.cards.map((c) => (c.id === id ? { ...c, column } : c)) }
           : prev,
       );
-      await api.moveCard(id, column, index);
+      try {
+        await api.moveCard(id, column, index);
+      } catch {
+        // The card may have started between drag-start and drop. Restore the
+        // authoritative position if the server rejects that race.
+        await refresh();
+      }
     },
-    [],
+    [board, refresh],
   );
 
   const quickAdd = useCallback(async (column, prompt) => {
@@ -285,14 +337,6 @@ export default function App() {
       <header className="topbar">
         <div className="brand">
           Kanban <em>Agents</em>
-        </div>
-
-        <div
-          className={`conn-status ${connected ? 'is-connected' : 'is-reconnecting'}`}
-          title={connected ? `Connected to ${window.location.origin}` : 'Lost connection to the server — retrying…'}
-        >
-          <span className="conn-dot" />
-          {connected ? window.location.host : 'Reconnecting…'}
         </div>
 
         <div className={`queue-status ${paused ? 'is-paused' : ''}`}>
@@ -348,8 +392,9 @@ export default function App() {
 
       {board.auth && !board.auth.ok && (
         <div className="auth-bar">
-          <strong>Claude isn&rsquo;t logged in.</strong> {board.auth.reason} {board.auth.hint}
-          <span className="auth-cmd">claude</span>
+          <strong>{board.settings.agent === 'codex' ? 'Codex' : 'Claude'} isn&rsquo;t logged in.</strong>{' '}
+          {board.auth.reason} {board.auth.hint}
+          <span className="auth-cmd">{board.settings.agent === 'codex' ? 'npm run login:codex' : 'claude'}</span>
         </div>
       )}
 
@@ -374,15 +419,20 @@ export default function App() {
         <span className="sep">&mdash;</span>
 
         {board.projectRun?.running ? (
-          <a
-            className="project-run is-running"
-            href={board.projectRun.url}
-            target="_blank"
-            rel="noreferrer"
-            title={board.projectRun.command ? `Started with: ${board.projectRun.command}` : 'Open in a new tab'}
-          >
-            <span className="live-dot" /> Running at {board.projectRun.url}
-          </a>
+          <>
+            <a
+              className="project-run is-running"
+              href={board.projectRun.url}
+              target="_blank"
+              rel="noreferrer"
+              title={board.projectRun.command ? `Started with: ${board.projectRun.command}` : 'Open in a new tab'}
+            >
+              <span className="live-dot" /> Running at {board.projectRun.url}
+            </a>
+            <button className="btn btn-run" onClick={runProject} disabled={starting}>
+              {starting ? 'Queuing…' : '↻ Restart'}
+            </button>
+          </>
         ) : (
           <button className="btn btn-run" onClick={runProject} disabled={starting}>
             {starting ? 'Starting…' : '▶ Run project'}
@@ -417,6 +467,7 @@ export default function App() {
           card={openCard}
           settings={board.settings}
           isRunning={openCard.id === board.runningCardId}
+          hasRunningTask={Boolean(board.runningCardId)}
           columns={board.columns}
           onClose={() => setOpenCardId(null)}
           onChanged={refresh}
