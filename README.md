@@ -1,5 +1,9 @@
 # Kanban Agents
 
+[![Watch the Kanban Agents demo](demo/frames/01-intro.png)](demo/kanban-agents-demo.mp4)
+
+[Watch the demo video](demo/kanban-agents-demo.mp4)
+
 A Trello-style board that schedules Claude Code or Codex sessions. Drag a card into
 **In Progress** and it runs. Cards run **strictly one at a time per project**,
 so tasks sharing a working directory build on previous changes instead of
